@@ -2,7 +2,7 @@
 // Uses Node's built-in WebSocket (Node 21+). No dependencies.
 // Verifies: join -> welcome, ~60Hz state stream, pong echo.
 
-const URL = process.argv[2] || "ws://localhost:3000";
+const URL = process.argv[2] || process.env.SMOKE_URL || "ws://localhost:3000";
 const DURATION_MS = 1200;
 
 const ws = new WebSocket(URL);
