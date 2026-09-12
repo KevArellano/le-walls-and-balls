@@ -1,0 +1,19 @@
+# Netlify config for the Speck thin browser tester (MVP-2a).
+# Publishes the static web-tester/ directory. No build step — it's a single
+# self-contained HTML file that connects to the Railway backend over wss://.
+
+[build]
+  publish = "web-tester"
+  command = ""
+
+# SPA-style fallback so deep links like /?room=CODE resolve to index.html.
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
+
+# Static assets are immutable enough for a short cache; index stays fresh.
+[[headers]]
+  for = "/index.html"
+  [headers.values]
+    Cache-Control = "no-cache"

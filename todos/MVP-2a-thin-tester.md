@@ -16,9 +16,10 @@ in the full frontend (MVP-2b).
   - Keyboard WASD/arrows → normalized `{t:"input", x, y, seq}` each frame.
   - Render pillars (static, from §0) + all players from latest `state`.
   - Show connection status + latency (ping every 2s, measure pong).
-- [ ] 2. Serve locally: `npx --yes serve web-tester` (or any static server) and open.
-- [ ] 3. Test against local server, then against `wss://<railway-domain>`:
-  - Open two browser tabs in the same room → both dots visible, they collide.
+- [x] 2. Serve locally: `npx --yes serve web-tester -l 5050` → http://localhost:5050
+- [x] 3. Test against `wss://le-walls-and-balls-production.up.railway.app`:
+  - VERIFIED by user — normal browser + incognito, two players same room,
+    both dots visible and colliding. Live re-check: 36ms RTT, 61Hz, PASS.
 
 ## Notes
 - No prediction/reconciliation here — just render server truth directly. Movement

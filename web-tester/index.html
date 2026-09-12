@@ -69,7 +69,10 @@ const PALETTE = ["#E07A5F", "#81B29A", "#7EB2DD", "#F2CC8F", "#D4A5A5", "#A7C4A0
 
 // ---- Query-param / default config ----
 const params = new URLSearchParams(location.search);
-const defaultServer = params.get("server") || "ws://localhost:3000";
+// Default backend: local dev when opened locally, else the live Railway server.
+const PROD_WS = "wss://le-walls-and-balls-production.up.railway.app";
+const isLocal = ["localhost", "127.0.0.1"].includes(location.hostname);
+const defaultServer = params.get("server") || (isLocal ? "ws://localhost:3000" : PROD_WS);
 const $ = (id) => document.getElementById(id);
 $("server").value = defaultServer;
 $("room").value = params.get("room") || "smoke";
@@ -141,17 +144,21 @@ function connect() {
     }
   });
 
-  ws.addEventListener("close", () => {
+  ws.addEventListener("close", (ev) => {
     joined = false; players = [];
     clearInterval(pingTimer);
+    console.warn("[speck] socket closed", { code: ev.code, reason: ev.reason, wasClean: ev.wasClean, url });
     if (!explicitClose) {
-      setStatus("reconnecting…", "wait");
+      setStatus(`reconnecting… (closed ${ev.code})`, "wait");
       setTimeout(connect, 1000);
     } else {
       setStatus("disconnected", "bad");
     }
   });
-  ws.addEventListener("error", () => setStatus("error", "bad"));
+  ws.addEventListener("error", (ev) => {
+    console.error("[speck] socket error connecting to", url, ev);
+    setStatus("error — see console (F12)", "bad");
+  });
 }
 $("connect").addEventListener("click", connect);
 
@@ -239,8 +246,9 @@ function draw() {
 }
 requestAnimationFrame(draw);
 
-// Auto-connect on load if a ?server= was provided.
-if (params.get("server")) connect();
+// Auto-connect on load when a ?server= was provided, or when served remotely
+// (e.g. from Netlify) where the default already points at the Railway backend.
+if (params.get("server") || !isLocal) connect();
 </script>
 </body>
 </html>
