@@ -1,0 +1,5 @@
+# Rust build artifacts
+server-rs/target/
+
+# Node
+node_modules/

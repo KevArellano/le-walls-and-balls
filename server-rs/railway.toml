@@ -1,0 +1,7 @@
+[build]
+dockerfilePath = "Dockerfile"
+
+[deploy]
+healthcheckPath = ""          # TCP-only check; the server rejects plain HTTP handshakes
+healthcheckTimeout = 5
+restartPolicyType = "ALWAYS"
