@@ -63,7 +63,7 @@ ws.addEventListener("message", (ev) => {
   }
 });
 
-ws.addEventListener("error", (e) => fail("socket error: " + (e.message || e)));
+ws.addEventListener("error", (e) => fail("socket error: " + (e.message || e.error?.message || JSON.stringify(e.error) || e)));
 
 setTimeout(() => {
   ws.close();

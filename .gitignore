@@ -3,3 +3,7 @@ server-rs/target/
 
 # Node
 node_modules/
+
+# Throwaway smoke-test output logs
+prod-smoke.txt
+server-rs/smoke-out.txt

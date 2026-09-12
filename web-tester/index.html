@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Speck — Thin WS Tester (MVP-2a)</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%;
+    background: #0e0f13; color: #e8e8ea;
+    font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    overflow: hidden;
+  }
+  #hud {
+    position: fixed; top: 10px; left: 10px; z-index: 10;
+    background: rgba(20,22,28,0.82); border: 1px solid #2a2d36;
+    border-radius: 10px; padding: 10px 12px; font-size: 13px; line-height: 1.5;
+    max-width: 320px; backdrop-filter: blur(4px);
+  }
+  #hud b { color: #81B29A; }
+  #status.ok { color: #81B29A; }
+  #status.bad { color: #E07A5F; }
+  #status.wait { color: #F2CC8F; }
+  .row { display: flex; gap: 8px; align-items: center; margin-top: 6px; }
+  input {
+    background: #14161c; border: 1px solid #2a2d36; color: #e8e8ea;
+    border-radius: 6px; padding: 4px 6px; font-size: 12px; width: 100%;
+  }
+  button {
+    background: #7EB2DD; color: #0e0f13; border: none; border-radius: 6px;
+    padding: 5px 10px; font-size: 12px; font-weight: 600; cursor: pointer;
+  }
+  button:hover { filter: brightness(1.1); }
+  #hint { margin-top: 8px; color: #8b8f9a; font-size: 11px; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<div id="hud">
+  <div>Speck <b>thin tester</b> — renders server truth (no prediction)</div>
+  <div class="row">
+    <input id="server" placeholder="ws://localhost:3000" />
+  </div>
+  <div class="row">
+    <input id="room" placeholder="room" style="width:90px" />
+    <input id="name" placeholder="name" style="width:90px" />
+    <input id="color" placeholder="#E07A5F" style="width:80px" />
+  </div>
+  <div class="row">
+    <button id="connect">Connect</button>
+    <span id="status" class="bad">disconnected</span>
+  </div>
+  <div>players: <b id="count">0</b> &nbsp; latency: <b id="lat">–</b> ms &nbsp; state: <b id="hz">0</b> Hz</div>
+  <div id="hint">WASD / arrow keys to move. Open two tabs in the same room to test collisions.</div>
+</div>
+<canvas id="c"></canvas>
+<script type="module">
+// ---- Shared constants (spec §0) — for rendering only ----
+const ARENA_W = 1800, ARENA_H = 1200;
+const PLAYER_R = 22;
+const PILLARS = [
+  [520, 360, 48], [1280, 360, 48],
+  [520, 840, 48], [1280, 840, 48],
+  [900, 600, 36],
+];
+const PALETTE = ["#E07A5F", "#81B29A", "#7EB2DD", "#F2CC8F", "#D4A5A5", "#A7C4A0"];
+
+// ---- Query-param / default config ----
+const params = new URLSearchParams(location.search);
+const defaultServer = params.get("server") || "ws://localhost:3000";
+const $ = (id) => document.getElementById(id);
+$("server").value = defaultServer;
+$("room").value = params.get("room") || "smoke";
+$("name").value = "Web-" + Math.floor(Math.random() * 1000);
+$("color").value = PALETTE[Math.floor(Math.random() * PALETTE.length)];
+
+// ---- Canvas / camera ----
+const canvas = $("c");
+const ctx = canvas.getContext("2d");
+let view = { scale: 1, ox: 0, oy: 0 };
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.floor(innerWidth * dpr);
+  canvas.height = Math.floor(innerHeight * dpr);
+  // Fit the whole arena into the viewport, centered.
+  const s = Math.min(canvas.width / ARENA_W, canvas.height / ARENA_H) * 0.92;
+  view.scale = s;
+  view.ox = (canvas.width - ARENA_W * s) / 2;
+  view.oy = (canvas.height - ARENA_H * s) / 2;
+}
+addEventListener("resize", resize);
+resize();
+const wx = (x) => view.ox + x * view.scale;
+const wy = (y) => view.oy + y * view.scale;
+
+// ---- Networking (raw WebSocket, no framework) ----
+let ws = null, selfId = null, joined = false, explicitClose = false;
+let players = [];        // latest snapshot
+let inputSeq = 0;
+let stateTimestamps = [];
+let latencyMs = null;
+let pingTimer = null;
+
+function setStatus(text, cls) {
+  const el = $("status"); el.textContent = text; el.className = cls;
+}
+
+function connect() {
+  if (ws) { explicitClose = true; try { ws.close(); } catch {} }
+  explicitClose = false;
+  const url = $("server").value.trim();
+  const room = $("room").value.trim() || "smoke";
+  const name = $("name").value.trim() || "Web";
+  const color = $("color").value.trim() || "#E07A5F";
+  setStatus("connecting…", "wait");
+  try { ws = new WebSocket(url); } catch (e) { setStatus("bad url", "bad"); return; }
+
+  ws.addEventListener("open", () => {
+    setStatus("connected", "ok");
+    ws.send(JSON.stringify({ t: "join", room, name, color }));
+    clearInterval(pingTimer);
+    pingTimer = setInterval(() => {
+      if (ws && ws.readyState === 1) ws.send(JSON.stringify({ t: "ping", ts: Date.now() }));
+    }, 2000);
+  });
+
+  ws.addEventListener("message", (ev) => {
+    let msg; try { msg = JSON.parse(ev.data); } catch { return; }
+    switch (msg.t) {
+      case "welcome": selfId = msg.id; joined = true; setStatus("joined", "ok"); break;
+      case "state":
+        players = msg.players;
+        stateTimestamps.push(performance.now());
+        if (stateTimestamps.length > 90) stateTimestamps.shift();
+        break;
+      case "pong": latencyMs = Date.now() - msg.ts; break;
+      case "player_leave": if (msg.id === "full") setStatus("room full", "bad"); break;
+      case "player_join": case "bump": break;
+    }
+  });
+
+  ws.addEventListener("close", () => {
+    joined = false; players = [];
+    clearInterval(pingTimer);
+    if (!explicitClose) {
+      setStatus("reconnecting…", "wait");
+      setTimeout(connect, 1000);
+    } else {
+      setStatus("disconnected", "bad");
+    }
+  });
+  ws.addEventListener("error", () => setStatus("error", "bad"));
+}
+$("connect").addEventListener("click", connect);
+
+// ---- Input: WASD / arrows -> normalized {x,y} ----
+const keys = new Set();
+addEventListener("keydown", (e) => {
+  if (["ArrowUp","ArrowDown","ArrowLeft","ArrowRight"," "].includes(e.key)) e.preventDefault();
+  keys.add(e.key.toLowerCase());
+});
+addEventListener("keyup", (e) => keys.delete(e.key.toLowerCase()));
+
+let lastNonZero = false;
+function sampleAndSendInput() {
+  let x = 0, y = 0;
+  if (keys.has("a") || keys.has("arrowleft")) x -= 1;
+  if (keys.has("d") || keys.has("arrowright")) x += 1;
+  if (keys.has("w") || keys.has("arrowup")) y -= 1;
+  if (keys.has("s") || keys.has("arrowdown")) y += 1;
+  const mag = Math.hypot(x, y);
+  if (mag > 1) { x /= mag; y /= mag; }
+  const nonZero = mag > 0;
+  // Send when moving, plus one final zero frame to stop cleanly.
+  if ((nonZero || lastNonZero) && ws && ws.readyState === 1 && joined) {
+    ws.send(JSON.stringify({ t: "input", x, y, seq: inputSeq++ }));
+  }
+  lastNonZero = nonZero;
+}
+
+// ---- Render loop ----
+function draw() {
+  sampleAndSendInput();
+
+  ctx.fillStyle = "#0e0f13";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  // Rink border (playable inset ignored here; draw full arena bounds).
+  ctx.strokeStyle = "#2a2d36";
+  ctx.lineWidth = 2 * view.scale;
+  ctx.strokeRect(wx(0), wy(0), ARENA_W * view.scale, ARENA_H * view.scale);
+
+  // Grid.
+  ctx.strokeStyle = "rgba(255,255,255,0.03)";
+  ctx.lineWidth = 1;
+  for (let gx = 0; gx <= ARENA_W; gx += 150) {
+    ctx.beginPath(); ctx.moveTo(wx(gx), wy(0)); ctx.lineTo(wx(gx), wy(ARENA_H)); ctx.stroke();
+  }
+  for (let gy = 0; gy <= ARENA_H; gy += 150) {
+    ctx.beginPath(); ctx.moveTo(wx(0), wy(gy)); ctx.lineTo(wx(ARENA_W), wy(gy)); ctx.stroke();
+  }
+
+  // Pillars.
+  ctx.fillStyle = "#3a3f4b";
+  for (const [px, py, pr] of PILLARS) {
+    ctx.beginPath(); ctx.arc(wx(px), wy(py), pr * view.scale, 0, Math.PI * 2); ctx.fill();
+  }
+
+  // Players (server truth).
+  for (const p of players) {
+    const isSelf = p.id === selfId;
+    ctx.beginPath();
+    ctx.arc(wx(p.x), wy(p.y), PLAYER_R * view.scale, 0, Math.PI * 2);
+    ctx.fillStyle = p.color || "#E07A5F";
+    ctx.globalAlpha = isSelf ? 1 : 0.85;
+    ctx.fill();
+    ctx.globalAlpha = 1;
+    if (isSelf) {
+      ctx.lineWidth = 3 * view.scale; ctx.strokeStyle = "#ffffff"; ctx.stroke();
+    }
+    // Name label.
+    ctx.fillStyle = "#e8e8ea";
+    ctx.font = `${Math.max(11, 13 * view.scale)}px system-ui`;
+    ctx.textAlign = "center";
+    ctx.fillText(p.name || "player", wx(p.x), wy(p.y) - (PLAYER_R + 8) * view.scale);
+  }
+
+  // HUD stats.
+  $("count").textContent = players.length;
+  $("lat").textContent = latencyMs == null ? "–" : latencyMs;
+  if (stateTimestamps.length > 2) {
+    const span = (stateTimestamps[stateTimestamps.length - 1] - stateTimestamps[0]) / 1000;
+    $("hz").textContent = span > 0 ? (stateTimestamps.length / span).toFixed(0) : "0";
+  }
+
+  requestAnimationFrame(draw);
+}
+requestAnimationFrame(draw);
+
+// Auto-connect on load if a ?server= was provided.
+if (params.get("server")) connect();
+</script>
+</body>
+</html>
