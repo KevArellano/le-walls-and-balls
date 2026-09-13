@@ -94,6 +94,7 @@
   <div>players: <b id="count">0</b> &nbsp; latency: <b id="lat">–</b> ms &nbsp; state: <b id="hz">0</b> Hz</div>
   <div class="row">
     <button id="ready">Ready ✗</button>
+    <button id="mute">🔊</button>
     <span id="campaign">lobby</span>
   </div>
   <div id="hint">WASD / arrow keys to move. Open two tabs in the same room to test collisions. Everyone press <b>Ready</b> to auto-start the campaign.</div>
@@ -391,6 +392,88 @@ $("ready").addEventListener("click", () => {
   updateReadyButton();
 });
 
+// ---- Music: one loop per phase, driven purely by campaign.phase/level ----
+// Files live in ./audio/ and ship with the site. We have 4 tracks: the lobby
+// theme and one per level. Victory reuses the lobby track (it returns you to
+// ready-up). Missing files fail silent — never throw.
+const MUSIC = {
+  lobby: "audio/lobby.mp3",
+  level1: "audio/level1.mp3",
+  level2: "audio/level2.mp3",
+  level3: "audio/level3.mp3",
+};
+const MUSIC_VOLUME = 0.5;   // target volume for the active track
+const FADE_PER_SEC = 1.6;   // cross-fade speed (volume units/sec)
+
+// Pre-create looping Audio elements, one per unique file.
+const musicEls = {};
+for (const [key, src] of Object.entries(MUSIC)) {
+  const a = new Audio(src);
+  a.loop = true;
+  a.preload = "auto";
+  a.volume = 0;
+  // Swallow load/decment errors so a missing file is silent, not fatal.
+  a.addEventListener("error", () => {});
+  musicEls[key] = a;
+}
+
+let musicUnlocked = false;   // set true after first user gesture
+let musicMuted = false;
+let currentTrack = null;     // key of the track we want playing
+
+// Map campaign state -> track key. Null means "no music" (e.g. free-play).
+function trackForCampaign() {
+  if (!campaign) return null;
+  if (campaign.phase === "lobby" || campaign.phase === "victory") return "lobby";
+  if (campaign.phase === "playing") {
+    const key = "level" + (campaign.level + 1); // level index 0 -> level1
+    return MUSIC[key] ? key : "lobby";
+  }
+  return null;
+}
+
+// Switch the desired track. Actual volume easing happens in updateMusic().
+function setTrack(key) {
+  if (key === currentTrack) return;
+  currentTrack = key;
+  if (musicUnlocked && key && musicEls[key] && musicEls[key].paused) {
+    musicEls[key].play().catch(() => {}); // autoplay/promise rejection -> ignore
+  }
+}
+
+// Ease every track toward its target volume: the current one up, others down.
+// Pause tracks once they've faded fully out to free the decoder.
+function updateMusic(dt) {
+  const step = FADE_PER_SEC * dt;
+  for (const [key, a] of Object.entries(musicEls)) {
+    const target = (!musicMuted && key === currentTrack) ? MUSIC_VOLUME : 0;
+    if (a.volume < target) a.volume = Math.min(target, a.volume + step);
+    else if (a.volume > target) a.volume = Math.max(target, a.volume - step);
+    if (a.volume === 0 && !a.paused && key !== currentTrack) a.pause();
+  }
+}
+
+// Browsers block audio until a user gesture. Unlock on the first interaction,
+// then start whatever track the campaign currently wants.
+function unlockMusic() {
+  if (musicUnlocked) return;
+  musicUnlocked = true;
+  if (currentTrack && musicEls[currentTrack]) {
+    musicEls[currentTrack].play().catch(() => {});
+  }
+}
+addEventListener("pointerdown", unlockMusic, { once: false });
+addEventListener("keydown", unlockMusic, { once: false });
+
+$("mute").addEventListener("click", () => {
+  musicMuted = !musicMuted;
+  $("mute").textContent = musicMuted ? "🔇" : "🔊";
+  // If unmuting and a track is wanted, make sure it's playing.
+  if (!musicMuted && musicUnlocked && currentTrack) {
+    musicEls[currentTrack].play().catch(() => {});
+  }
+});
+
 // ---- Input: WASD / arrows -> normalized {x,y} ----
 const keys = new Set();
 addEventListener("keydown", (e) => {
@@ -510,6 +593,10 @@ function draw(now) {
   lastFrameTs = now;
   if (dt > 0.1) dt = 0.1; // clamp after tab was backgrounded
   pumpHeldInput(dt);
+
+  // Music follows the campaign phase/level (client-only; no server involvement).
+  setTrack(trackForCampaign());
+  updateMusic(dt);
 
   ctx.fillStyle = "#0e0f13";
   ctx.fillRect(0, 0, canvas.width, canvas.height);
