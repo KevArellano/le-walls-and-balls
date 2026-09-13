@@ -170,8 +170,8 @@ function resolvePillarBody(b, px, py, pr) {
 // playing, otherwise the base pillars. This must match the server's step 3
 // (room.rs) or the self dot ghosts through walls and rubber-bands.
 function activeObstacles() {
-  if (campaign && campaign.phase === "playing" && campaign.walls.length) {
-    return campaign.walls.map((w) => [w.x, w.y, w.r]);
+  if (campaign && campaign.phase === "playing" && level && level.walls.length) {
+    return level.walls.map((w) => [w.x, w.y, w.r]);
   }
   return PILLARS;
 }
@@ -213,10 +213,21 @@ const wx = (x) => view.ox + x * view.scale;
 const wy = (y) => view.oy + y * view.scale;
 
 // ---- Networking (raw WebSocket, no framework) ----
-let ws = null, selfId = null, joined = false, explicitClose = false;
-let players = [];        // latest snapshot (remote truth for other players)
-let campaign = null;     // latest campaign block from state (null in free-play)
-let iAmReady = false;    // local intent, echoed by server via players[].ready
+// v2 wire format: per-tick player state is index-keyed and integer-rounded;
+// identity (name/color) arrives once via player_join; static level geometry
+// arrives once via `level`; enemies/items come as per-tick deltas.
+let ws = null, selfId = null, selfIdx = null, joined = false, explicitClose = false;
+// peers: idx -> { id, name, color }. Identity, sent once on join.
+const peers = new Map();
+// players: idx -> { x, y, vx, vy, q, ready }. Latest per-tick truth.
+let players = new Map();
+// campaign: { phase, level, levels, in_zone, total } scalars (no geometry).
+let campaign = null;
+// level: cached static geometry + entity state, built from `level` + deltas:
+//   { index, levels, walls:[{x,y,r}], exit:{x,y,r},
+//     enemies: Map(i -> {x,y,r,hp,alive}), items: Map(i -> {x,y,collected}) }
+let level = null;
+let iAmReady = false;    // local intent, echoed by server via players[selfIdx].ready
 let inputSeq = 0;
 let stateTimestamps = [];
 let latencyMs = null;
@@ -227,17 +238,35 @@ let pingTimer = null;
 let selfPred = null;               // { x, y, vx, vy } or null until first state
 const inputBuffer = [];            // [{ seq, x, y }] sent but maybe unacked
 
+// Apply per-tick campaign deltas onto the cached level geometry. Enemies carry
+// new positions (+ `d` when they just died); items carry the indices collected.
+function applyCampaignDeltas(c) {
+  if (c.enemies) {
+    for (const e of c.enemies) {
+      const cur = level.enemies.get(e.i);
+      if (cur) { cur.x = e.x; cur.y = e.y; if (e.d) cur.alive = false; }
+    }
+  }
+  if (c.items) {
+    for (const i of c.items) {
+      const it = level.items.get(i);
+      if (it) it.collected = true;
+    }
+  }
+}
+
 function reconcile(serverSelf) {
+  // serverSelf is the compact record { x, y, vx, vy, q } (integer units).
   // First authoritative fix: adopt server state outright.
   if (!selfPred) {
     selfPred = { x: serverSelf.x, y: serverSelf.y, vx: serverSelf.vx, vy: serverSelf.vy };
     // Drop everything acknowledged.
-    while (inputBuffer.length && inputBuffer[0].seq <= serverSelf.seq) inputBuffer.shift();
+    while (inputBuffer.length && inputBuffer[0].seq <= serverSelf.q) inputBuffer.shift();
     return;
   }
 
   // 1. Drop inputs the server has already processed.
-  while (inputBuffer.length && inputBuffer[0].seq <= serverSelf.seq) inputBuffer.shift();
+  while (inputBuffer.length && inputBuffer[0].seq <= serverSelf.q) inputBuffer.shift();
 
   // 2. Replay unacknowledged inputs from the authoritative state.
   const replay = { x: serverSelf.x, y: serverSelf.y, vx: serverSelf.vx, vy: serverSelf.vy };
@@ -302,36 +331,77 @@ function connect() {
     let msg; try { msg = JSON.parse(ev.data); } catch { return; }
     switch (msg.t) {
       case "welcome":
-        selfId = msg.id; joined = true; setStatus("joined", "ok");
+        selfId = msg.id; selfIdx = msg.idx; joined = true; setStatus("joined", "ok");
         selfPred = null; inputBuffer.length = 0; inputSeq = 0;
+        peers.clear(); players = new Map(); level = null;
+        // Register self identity from the join we sent.
+        peers.set(selfIdx, { id: selfId, name: $("name").value.trim() || "Web", color: $("color").value.trim() || "#E07A5F" });
         iAmReady = false; updateReadyButton();
         break;
+
+      case "player_join":
+        peers.set(msg.idx, { id: msg.id, name: msg.name, color: msg.color });
+        break;
+
+      case "player_leave":
+        if (msg.id === "full") { setStatus("room full", "bad"); break; }
+        // Remove by id: find the matching index in peers.
+        for (const [i, p] of peers) if (p.id === msg.id) { peers.delete(i); players.delete(i); break; }
+        break;
+
+      case "level":
+        // One-shot static geometry + full entity sets for the current level.
+        level = {
+          index: msg.index, levels: msg.levels,
+          walls: msg.walls,
+          exit: msg.exit,
+          enemies: new Map(msg.enemies.map((e) => [e.i, { x: e.x, y: e.y, r: e.r, hp: e.hp, alive: true }])),
+          items: new Map(msg.items.map((it) => [it.i, { x: it.x, y: it.y, collected: false }])),
+        };
+        // A new level (index 0 = fresh run) clears our local ready intent.
+        if (msg.index === 0) { iAmReady = false; updateReadyButton(); }
+        break;
+
       case "state":
-        players = msg.players;
+        // Compact index-keyed players. Merge into the map (add/update).
+        {
+          const seen = new Set();
+          for (const p of msg.players) {
+            players.set(p.i, { x: p.x, y: p.y, vx: p.vx, vy: p.vy, q: p.q, ready: p.r });
+            seen.add(p.i);
+          }
+          // Drop players no longer present (defensive; player_leave also handles).
+          for (const i of [...players.keys()]) if (!seen.has(i)) players.delete(i);
+        }
         campaign = msg.campaign || null;
+        // Apply campaign deltas onto the cached level geometry.
+        if (campaign && level) applyCampaignDeltas(campaign);
         stateTimestamps.push(performance.now());
         if (stateTimestamps.length > 90) stateTimestamps.shift();
         // Reconcile the predicted self dot against server truth.
-        if (selfId) {
-          const me = players.find((p) => p.id === selfId);
+        if (selfIdx != null) {
+          const me = players.get(selfIdx);
           if (me) reconcile(me);
         }
         break;
+
       case "pong": latencyMs = Date.now() - msg.ts; break;
-      case "player_leave": if (msg.id === "full") setStatus("room full", "bad"); break;
+
       case "campaign":
-        // Edge trigger for level/victory transitions. The authoritative detail
-        // rides on state.campaign; this is just a cue. On a new run/level the
-        // server clears our ready flag, so reset local intent.
-        if (msg.phase === "victory" || msg.level === 0) { iAmReady = false; updateReadyButton(); }
+        // Edge trigger for victory / lobby reset. Level starts come via `level`.
+        if (msg.phase === "victory") {
+          iAmReady = false; updateReadyButton();
+          level = null; // clear the arena on the victory screen
+        }
         break;
-      case "player_join": case "bump": break;
+
+      case "bump": break;
     }
   });
 
   sock.addEventListener("close", (ev) => {
     if (!isCurrent()) return;   // a retired socket closing — ignore
-    joined = false; players = [];
+    joined = false; players = new Map();
     clearInterval(pingTimer);
     console.warn("[speck] socket closed", { code: ev.code, reason: ev.reason, wasClean: ev.wasClean, url });
     if (!explicitClose) {
@@ -360,7 +430,8 @@ function disconnect() {
   }
   teardown(ws);
   ws = null;
-  joined = false; selfId = null; players = []; campaign = null;
+  joined = false; selfId = null; selfIdx = null;
+  players = new Map(); peers.clear(); campaign = null; level = null;
   iAmReady = false; updateReadyButton();
   setStatus("disconnected", "bad");
 }
@@ -658,12 +729,13 @@ function draw(now) {
   }
 
   // Campaign layer: exit zone (under everything), walls, items, enemies.
-  if (playing) {
-    const c = campaign;
+  // Geometry comes from the cached `level` (from the one-shot `level` message),
+  // updated in place by per-tick deltas.
+  if (playing && level) {
+    const cleared = [...level.enemies.values()].every((e) => !e.alive);
     // Exit zone — filled ring the group gathers in. Turns green once cleared.
-    const cleared = c.enemies.every((e) => !e.alive);
     ctx.beginPath();
-    ctx.arc(wx(c.exit.x), wy(c.exit.y), c.exit.r * view.scale, 0, Math.PI * 2);
+    ctx.arc(wx(level.exit.x), wy(level.exit.y), level.exit.r * view.scale, 0, Math.PI * 2);
     ctx.fillStyle = cleared ? "rgba(129,178,154,0.16)" : "rgba(242,204,143,0.10)";
     ctx.fill();
     ctx.lineWidth = 2 * view.scale;
@@ -673,10 +745,10 @@ function draw(now) {
     ctx.setLineDash([]);
 
     // Walls (static obstacles) — body + true collision boundary.
-    for (const w of c.walls) drawObstacle(w.x, w.y, w.r);
+    for (const w of level.walls) drawObstacle(w.x, w.y, w.r);
 
     // Items (uncollected only).
-    for (const it of c.items) {
+    for (const it of level.items.values()) {
       if (it.collected) continue;
       const r = 16 * view.scale;
       ctx.beginPath(); ctx.arc(wx(it.x), wy(it.y), r, 0, Math.PI * 2);
@@ -685,7 +757,7 @@ function draw(now) {
     }
 
     // Enemies (living only). Red dots with an HP pip count.
-    for (const e of c.enemies) {
+    for (const e of level.enemies.values()) {
       if (!e.alive) continue;
       ctx.beginPath(); ctx.arc(wx(e.x), wy(e.y), e.r * view.scale, 0, Math.PI * 2);
       ctx.fillStyle = "#E07A5F"; ctx.fill();
@@ -699,15 +771,17 @@ function draw(now) {
   }
 
   // Players. Remotes render at server truth; the self dot renders at the
-  // locally PREDICTED position for zero-latency feel (spec §F4).
-  for (const p of players) {
-    const isSelf = p.id === selfId;
+  // locally PREDICTED position for zero-latency feel (spec §F4). Identity
+  // (name/color) is joined from the `peers` map by index.
+  for (const [idx, p] of players) {
+    const isSelf = idx === selfIdx;
+    const who = peers.get(idx) || {};
     // Use prediction for self when available, else fall back to server truth.
     const rx = isSelf && selfPred ? selfPred.x : p.x;
     const ry = isSelf && selfPred ? selfPred.y : p.y;
     ctx.beginPath();
     ctx.arc(wx(rx), wy(ry), PLAYER_R * view.scale, 0, Math.PI * 2);
-    ctx.fillStyle = p.color || "#E07A5F";
+    ctx.fillStyle = who.color || "#E07A5F";
     ctx.globalAlpha = isSelf ? 1 : 0.85;
     ctx.fill();
     ctx.globalAlpha = 1;
@@ -718,24 +792,29 @@ function draw(now) {
     ctx.fillStyle = "#e8e8ea";
     ctx.font = `${Math.max(11, 13 * view.scale)}px system-ui`;
     ctx.textAlign = "center";
-    ctx.fillText(p.name || "player", wx(rx), wy(ry) - (PLAYER_R + 8) * view.scale);
+    ctx.fillText(who.name || "player", wx(rx), wy(ry) - (PLAYER_R + 8) * view.scale);
   }
 
   // HUD stats.
-  $("count").textContent = players.length;
+  $("count").textContent = players.size;
   $("lat").textContent = latencyMs == null ? "–" : latencyMs;
 
   // Campaign status line.
   if (campaign) {
     const c = campaign;
     if (c.phase === "lobby") {
-      const readyCount = players.filter((p) => p.ready).length;
+      let readyCount = 0;
+      for (const p of players.values()) if (p.ready) readyCount++;
       $("campaign").textContent = `lobby — ready ${readyCount}/${c.total}`;
     } else if (c.phase === "playing") {
-      const alive = c.enemies.filter((e) => e.alive).length;
-      const items = c.items.filter((it) => !it.collected).length;
+      const levels = level ? level.levels : "?";
+      let alive = 0, items = 0;
+      if (level) {
+        for (const e of level.enemies.values()) if (e.alive) alive++;
+        for (const it of level.items.values()) if (!it.collected) items++;
+      }
       $("campaign").textContent =
-        `level ${c.level + 1}/${c.levels} — enemies ${alive} · items ${items} · in-zone ${c.in_zone}/${c.total}`;
+        `level ${c.level + 1}/${levels} — enemies ${alive} · items ${items} · in-zone ${c.in_zone}/${c.total}`;
     } else if (c.phase === "victory") {
       $("campaign").textContent = "🏆 victory! ready up to run again";
     }

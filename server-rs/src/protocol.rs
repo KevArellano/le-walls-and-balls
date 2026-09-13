@@ -1,4 +1,15 @@
 //! Wire protocol (spec §2). JSON over WebSocket, tagged by field `t`.
+//!
+//! v2 (egress-optimized) contract. Compared to v1 this:
+//!   - keys per-tick player state on a small per-room integer index (`i`)
+//!     instead of the 36-char UUID, and rounds positions/velocities to whole
+//!     world units with short field names;
+//!   - sends static level geometry (walls + exit) ONCE via `level`, not every
+//!     tick;
+//!   - sends enemies/items as per-tick DELTAS (only what changed), with the
+//!     full set delivered on level start via `level`;
+//!   - broadcasts `state` at a reduced cadence (see STATE_HZ in main.rs) while
+//!     the simulation still runs at 60Hz.
 
 use serde::{Deserialize, Serialize};
 
@@ -19,7 +30,7 @@ pub enum ClientMsg {
     #[serde(rename = "ping")]
     Ping { ts: u64 },
     /// Toggle this player's campaign ready flag. When every player in the room
-    /// is ready, the campaign auto-starts (spec: campaign extension).
+    /// is ready, the campaign auto-starts.
     #[serde(rename = "ready")]
     Ready { ready: bool },
 }
@@ -28,26 +39,38 @@ pub enum ClientMsg {
 #[derive(Serialize, Clone, Debug)]
 #[serde(tag = "t")]
 pub enum ServerMsg {
+    /// Assigns this client its player id and small per-room index.
     #[serde(rename = "welcome")]
-    Welcome { id: String, tick: u32 },
+    Welcome { id: String, idx: u8, tick: u32 },
+    /// Per-tick snapshot. `players` uses the compact index-keyed form; the
+    /// campaign block (when present) carries only per-tick dynamic deltas —
+    /// static geometry lives in `level`.
     #[serde(rename = "state")]
     State {
         tick: u32,
         players: Vec<PlayerState>,
-        /// Present only while a campaign is active or being set up. Omitted
-        /// entirely in the plain free-play case so existing clients are
-        /// unaffected (spec: campaign extension, backward-compatible).
         #[serde(skip_serializing_if = "Option::is_none")]
         campaign: Option<CampaignState>,
     },
-    /// Phase-transition notification for one-shot UI/audio cues (level begin,
-    /// victory). The authoritative detail always rides on `state.campaign`;
-    /// this is just an edge trigger.
+    /// One-shot static level geometry. Sent on level start (broadcast) and to a
+    /// newcomer who joins mid-level. Not repeated per tick.
+    #[serde(rename = "level")]
+    Level {
+        index: u8,
+        levels: u8,
+        walls: Vec<WallState>,
+        enemies: Vec<EnemyFull>,
+        items: Vec<ItemFull>,
+        exit: ZoneState,
+    },
+    /// Phase-transition edge trigger for UI/audio cues (victory, lobby reset).
+    /// Level starts are signalled by `level`; this covers the rest.
     #[serde(rename = "campaign")]
     Campaign { phase: String, level: u8 },
     #[serde(rename = "player_join")]
     PlayerJoin {
         id: String,
+        idx: u8,
         name: String,
         color: String,
     },
@@ -63,69 +86,82 @@ pub enum ServerMsg {
     },
 }
 
+/// Compact per-tick player state. Fields are single-letter to cut JSON tag
+/// overhead at the snapshot rate; positions/velocities are whole world units
+/// (sub-pixel precision is invisible after rendering + client interpolation).
 #[derive(Serialize, Clone, Debug)]
 pub struct PlayerState {
-    pub id: String,
-    pub name: String,
-    pub color: String,
-    pub x: f64,
-    pub y: f64,
-    pub vx: f64,
-    pub vy: f64,
-    pub seq: u32,
-    /// Campaign ready flag. Meaningful in the Lobby phase; harmless otherwise.
-    pub ready: bool,
+    /// Per-room player index (matches `welcome.idx` / `player_join.idx`).
+    pub i: u8,
+    pub x: i32,
+    pub y: i32,
+    pub vx: i32,
+    pub vy: i32,
+    /// Last processed input seq (reconciliation).
+    pub q: u32,
+    /// Campaign ready flag. Meaningful in Lobby; harmless otherwise.
+    pub r: bool,
 }
 
-/// Snapshot of campaign state, attached to `state` while a campaign is active.
+/// Per-tick campaign deltas. Static geometry (walls, exit) is NOT here — it
+/// arrives once via `level`. Only the dynamic, changed parts ride each tick.
 #[derive(Serialize, Clone, Debug)]
 pub struct CampaignState {
     /// "lobby" | "playing" | "victory".
     pub phase: String,
     /// 0-based level index while playing.
     pub level: u8,
-    /// Total levels in a run.
-    pub levels: u8,
-    /// Static walls for the current level (empty outside "playing").
-    pub walls: Vec<WallState>,
-    /// Living + dead enemies (dead ones flagged so clients can fade them out).
-    pub enemies: Vec<EnemyState>,
-    /// Pickups; collected ones flagged.
-    pub items: Vec<ItemState>,
-    /// The shared exit zone players gather in to advance.
-    pub exit: ZoneState,
-    /// Count of players currently standing inside the exit zone.
+    /// Enemies that changed since the last snapshot (moved or died), keyed by
+    /// index. Empty when nothing changed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub enemies: Vec<EnemyDelta>,
+    /// Item indices collected since the last snapshot. Empty when none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<u8>,
+    /// Count of players currently inside the exit zone.
     pub in_zone: u8,
-    /// Total players in the room (denominator for ready/in-zone UI).
+    /// Total players in the room.
     pub total: u8,
 }
 
 #[derive(Serialize, Clone, Debug)]
 pub struct WallState {
-    pub x: f64,
-    pub y: f64,
-    pub r: f64,
+    pub x: i32,
+    pub y: i32,
+    pub r: i32,
 }
 
+/// Full enemy record sent once in `level`.
 #[derive(Serialize, Clone, Debug)]
-pub struct EnemyState {
-    pub x: f64,
-    pub y: f64,
-    pub r: f64,
+pub struct EnemyFull {
+    pub i: u8,
+    pub x: i32,
+    pub y: i32,
+    pub r: i32,
     pub hp: i32,
-    pub alive: bool,
 }
 
+/// Per-tick enemy delta: new position, and `d=true` when it just died.
 #[derive(Serialize, Clone, Debug)]
-pub struct ItemState {
-    pub x: f64,
-    pub y: f64,
-    pub collected: bool,
+pub struct EnemyDelta {
+    pub i: u8,
+    pub x: i32,
+    pub y: i32,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub d: bool,
+}
+
+/// Full item record sent once in `level`.
+#[derive(Serialize, Clone, Debug)]
+pub struct ItemFull {
+    pub i: u8,
+    pub x: i32,
+    pub y: i32,
 }
 
 #[derive(Serialize, Clone, Debug)]
 pub struct ZoneState {
-    pub x: f64,
-    pub y: f64,
-    pub r: f64,
+    pub x: i32,
+    pub y: i32,
+    pub r: i32,
 }

@@ -5,7 +5,7 @@ use crate::physics::{
     integrate, pillars, resolve_circle_circle, resolve_walls, Body, ACCEL, ARENA_H, ARENA_W, STEP,
 };
 use crate::protocol::{
-    CampaignState, EnemyState, ItemState, PlayerState, ServerMsg, WallState, ZoneState,
+    CampaignState, EnemyDelta, EnemyFull, ItemFull, PlayerState, ServerMsg, WallState, ZoneState,
 };
 use std::collections::HashMap;
 
@@ -30,6 +30,8 @@ pub struct PlayerInput {
 
 pub struct Player {
     pub id: String,
+    /// Small per-room index used as the compact key on the wire.
+    pub idx: u8,
     pub name: String,
     pub color: String,
     pub body: Body,
@@ -37,6 +39,14 @@ pub struct Player {
     pub last_seq: u32,
     /// Campaign ready flag (Lobby phase).
     pub ready: bool,
+}
+
+/// Snapshot of an enemy's last-broadcast state, for computing per-tick deltas.
+#[derive(Clone, Copy, Default)]
+struct EnemySeen {
+    x: i32,
+    y: i32,
+    alive: bool,
 }
 
 pub struct Room {
@@ -52,6 +62,13 @@ pub struct Room {
     /// Seed for procedural generation; re-rolled each time a campaign starts so
     /// repeat runs differ, while a single run stays internally reproducible.
     campaign_seed: u64,
+    /// Monotonic per-room player index allocator (wraps at u8; MAX_PLAYERS=10
+    /// so collisions among live players are impossible in practice).
+    next_idx: u8,
+    /// Last-broadcast enemy state per enemy index, for delta computation.
+    enemy_seen: Vec<EnemySeen>,
+    /// Item collected-flags as last broadcast, for delta computation.
+    item_seen: Vec<bool>,
     /// Pre-allocated player-id ordering buffer to avoid per-tick allocation.
     id_buf: Vec<String>,
     /// Pre-allocated snapshot buffer.
@@ -71,6 +88,9 @@ impl Room {
             phase: Phase::Lobby,
             level: None,
             campaign_seed: 0,
+            next_idx: 0,
+            enemy_seen: Vec::new(),
+            item_seen: Vec::new(),
             id_buf: Vec::with_capacity(MAX_PLAYERS),
             state_buf: Vec::with_capacity(MAX_PLAYERS),
             body_buf: Vec::with_capacity(MAX_PLAYERS),
@@ -105,13 +125,17 @@ impl Room {
     }
 
     /// Add a player at a spawn position on the ring of radius 200 (spec §0).
-    pub fn add_player(&mut self, id: String, name: String, color: String) {
-        let index = self.players.len();
-        let angle = index as f64 * (2.0 * std::f64::consts::PI / MAX_PLAYERS as f64);
+    /// Returns the assigned per-room index for the join/welcome messages.
+    pub fn add_player(&mut self, id: String, name: String, color: String) -> u8 {
+        let ring = self.players.len();
+        let angle = ring as f64 * (2.0 * std::f64::consts::PI / MAX_PLAYERS as f64);
         let x = ARENA_W / 2.0 + angle.cos() * 200.0;
         let y = ARENA_H / 2.0 + angle.sin() * 200.0;
+        let idx = self.next_idx;
+        self.next_idx = self.next_idx.wrapping_add(1);
         let player = Player {
             id: id.clone(),
+            idx,
             name,
             color,
             body: Body::new_player(x, y),
@@ -120,6 +144,7 @@ impl Room {
             ready: false,
         };
         self.players.insert(id, player);
+        idx
     }
 
     pub fn remove_player(&mut self, id: &str) {
@@ -155,9 +180,10 @@ impl Room {
 
     /// Begin the campaign at level 0. Re-seeds so each run differs. Idempotent
     /// guard: only starts when not already playing (Lobby or Victory).
-    pub fn start_campaign(&mut self) {
+    /// Returns the one-shot `level` message to broadcast, if a campaign started.
+    pub fn start_campaign(&mut self) -> Option<ServerMsg> {
         if self.phase == Phase::Playing {
-            return;
+            return None;
         }
         // Cheap, non-crypto seed from tick + player count. Deterministic within
         // a run; different between runs.
@@ -166,10 +192,90 @@ impl Room {
             ^ (self.players.len() as u64).wrapping_add(1);
         self.phase = Phase::Playing;
         self.load_level(0);
+        Some(self.level_message())
     }
 
     fn load_level(&mut self, index: u8) {
-        self.level = Some(Level::generate(index, self.campaign_seed));
+        let level = Level::generate(index, self.campaign_seed);
+        // Reset delta trackers so the first post-load snapshot re-syncs against
+        // the freshly generated entities.
+        self.enemy_seen = level
+            .enemies
+            .iter()
+            .map(|e| EnemySeen {
+                x: e.body.pos.x as i32,
+                y: e.body.pos.y as i32,
+                alive: e.alive,
+            })
+            .collect();
+        self.item_seen = level.items.iter().map(|it| it.collected).collect();
+        self.level = Some(level);
+    }
+
+    /// Build the one-shot `level` message (static geometry + full entity sets).
+    /// Sent on level start and to newcomers who join mid-level.
+    pub fn level_message(&self) -> ServerMsg {
+        let l = self.level.as_ref();
+        let walls = l
+            .map(|l| {
+                l.walls
+                    .iter()
+                    .map(|w| WallState {
+                        x: w.pos.x as i32,
+                        y: w.pos.y as i32,
+                        r: w.r as i32,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let enemies = l
+            .map(|l| {
+                l.enemies
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| EnemyFull {
+                        i: i as u8,
+                        x: e.body.pos.x as i32,
+                        y: e.body.pos.y as i32,
+                        r: e.body.r as i32,
+                        hp: e.hp,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let items = l
+            .map(|l| {
+                l.items
+                    .iter()
+                    .enumerate()
+                    .map(|(i, it)| ItemFull {
+                        i: i as u8,
+                        x: it.x as i32,
+                        y: it.y as i32,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let exit = l
+            .map(|l| ZoneState {
+                x: l.exit.x as i32,
+                y: l.exit.y as i32,
+                r: l.exit.r as i32,
+            })
+            .unwrap_or(ZoneState { x: 0, y: 0, r: 0 });
+        ServerMsg::Level {
+            index: l.map(|l| l.index).unwrap_or(0),
+            levels: CAMPAIGN_LEVELS,
+            walls,
+            enemies,
+            items,
+            exit,
+        }
+    }
+
+    /// True if this room currently has a level to describe (mid-campaign).
+    pub fn has_level(&self) -> bool {
+        self.phase == Phase::Playing && self.level.is_some()
     }
 
     /// Set normalized input; scale down only when magnitude > 1 (spec §B3).
@@ -225,10 +331,9 @@ impl Room {
             }
         }
         // Restore the borrowed obstacle vec to its owner.
-        if self.phase == Phase::Playing && self.level.is_some() {
-            self.level.as_mut().unwrap().walls = obstacles;
-        } else {
-            self.pillars = std::mem::take(&mut obstacles);
+        match self.level.as_mut() {
+            Some(l) if self.phase == Phase::Playing => l.walls = obstacles,
+            _ => self.pillars = obstacles,
         }
 
         // 4. Player ↔ player collisions — O(n²), n ≤ 10. Emit bump if magnitude > 20.
@@ -339,11 +444,12 @@ impl Room {
                 });
                 return;
             } else {
-                self.level = Some(Level::generate(next, self.campaign_seed));
-                bumps.push(ServerMsg::Campaign {
-                    phase: "playing".to_string(),
-                    level: next,
-                });
+                // Advance: load the next level (resets delta trackers) and send
+                // its static geometry once via `level`. Per-tick snapshots then
+                // carry only deltas against it.
+                self.load_level(next);
+                let msg = self.level_message();
+                bumps.push(msg);
                 return;
             }
         }
@@ -360,26 +466,27 @@ impl Room {
         self.state_buf.clear();
         for p in self.players.values() {
             self.state_buf.push(PlayerState {
-                id: p.id.clone(),
-                name: p.name.clone(),
-                color: p.color.clone(),
-                x: p.body.pos.x,
-                y: p.body.pos.y,
-                vx: p.body.vel.x,
-                vy: p.body.vel.y,
-                seq: p.last_seq,
-                ready: p.ready,
+                i: p.idx,
+                x: p.body.pos.x as i32,
+                y: p.body.pos.y as i32,
+                vx: p.body.vel.x as i32,
+                vy: p.body.vel.y as i32,
+                q: p.last_seq,
+                r: p.ready,
             });
         }
+        let campaign = self.campaign_snapshot();
         ServerMsg::State {
             tick: self.tick,
             players: self.state_buf.clone(),
-            campaign: Some(self.campaign_snapshot()),
+            campaign,
         }
     }
 
-    /// Build the campaign portion of the snapshot from current phase + level.
-    fn campaign_snapshot(&self) -> CampaignState {
+    /// Build the per-tick campaign delta block. Static geometry is omitted
+    /// (it rides `level`); only changed enemies/items + the scalar counters go
+    /// out. Updates the `*_seen` trackers so subsequent ticks diff correctly.
+    fn campaign_snapshot(&mut self) -> Option<CampaignState> {
         let phase = match self.phase {
             Phase::Lobby => "lobby",
             Phase::Playing => "playing",
@@ -387,74 +494,68 @@ impl Room {
         };
         let total = self.players.len() as u8;
 
-        let (level_idx, walls, enemies, items, exit, in_zone) = match &self.level {
+        // Enemy + item deltas only exist while a level is loaded.
+        let (level_idx, enemy_deltas, item_deltas, in_zone) = match &self.level {
             Some(l) => {
-                let walls = l
-                    .walls
-                    .iter()
-                    .map(|w| WallState {
-                        x: w.pos.x,
-                        y: w.pos.y,
-                        r: w.r,
-                    })
-                    .collect();
-                let enemies = l
-                    .enemies
-                    .iter()
-                    .map(|e| EnemyState {
-                        x: e.body.pos.x,
-                        y: e.body.pos.y,
-                        r: e.body.r,
-                        hp: e.hp,
-                        alive: e.alive,
-                    })
-                    .collect();
-                let items = l
-                    .items
-                    .iter()
-                    .map(|it| ItemState {
-                        x: it.x,
-                        y: it.y,
-                        collected: it.collected,
-                    })
-                    .collect();
-                let exit = ZoneState {
-                    x: l.exit.x,
-                    y: l.exit.y,
-                    r: l.exit.r,
-                };
+                // Enemy deltas: moved ≥1 unit or alive-flag changed.
+                let mut enemy_deltas: Vec<EnemyDelta> = Vec::new();
+                for (i, e) in l.enemies.iter().enumerate() {
+                    let ex = e.body.pos.x as i32;
+                    let ey = e.body.pos.y as i32;
+                    let seen = self.enemy_seen.get(i).copied().unwrap_or_default();
+                    let moved = ex != seen.x || ey != seen.y;
+                    let died = e.alive != seen.alive;
+                    if moved || died {
+                        enemy_deltas.push(EnemyDelta {
+                            i: i as u8,
+                            x: ex,
+                            y: ey,
+                            d: !e.alive,
+                        });
+                    }
+                }
+                // Item deltas: indices that flipped to collected.
+                let mut item_deltas: Vec<u8> = Vec::new();
+                for (i, it) in l.items.iter().enumerate() {
+                    let seen = self.item_seen.get(i).copied().unwrap_or(false);
+                    if it.collected && !seen {
+                        item_deltas.push(i as u8);
+                    }
+                }
                 let in_zone = self
                     .players
                     .values()
                     .filter(|p| l.in_exit(p.body.pos.x, p.body.pos.y))
                     .count() as u8;
-                (l.index, walls, enemies, items, exit, in_zone)
+                (l.index, enemy_deltas, item_deltas, in_zone)
             }
-            None => (
-                0,
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                ZoneState {
-                    x: 0.0,
-                    y: 0.0,
-                    r: 0.0,
-                },
-                0,
-            ),
+            None => (0, Vec::new(), Vec::new(), 0),
         };
 
-        CampaignState {
+        // Commit the trackers to what we just observed (borrow of level ended).
+        if let Some(l) = &self.level {
+            self.enemy_seen.clear();
+            for e in l.enemies.iter() {
+                self.enemy_seen.push(EnemySeen {
+                    x: e.body.pos.x as i32,
+                    y: e.body.pos.y as i32,
+                    alive: e.alive,
+                });
+            }
+            self.item_seen.clear();
+            for it in l.items.iter() {
+                self.item_seen.push(it.collected);
+            }
+        }
+
+        Some(CampaignState {
             phase: phase.to_string(),
             level: level_idx,
-            levels: CAMPAIGN_LEVELS,
-            walls,
-            enemies,
-            items,
-            exit,
+            enemies: enemy_deltas,
+            items: item_deltas,
             in_zone,
             total,
-        }
+        })
     }
 }
 

@@ -25,6 +25,14 @@ const STEP_DURATION: Duration = Duration::from_nanos(1_000_000_000 / 60);
 /// and connections stay warm — without paying 60Hz for a static scene.
 const IDLE_KEEPALIVE_EVERY: u32 = 30; // ~2 snapshots/sec while idle
 
+/// Active `state` broadcast rate. The simulation always runs at 60Hz, but the
+/// client interpolates remote players ~90ms behind real time, so 60Hz snapshots
+/// are wasted bandwidth for remotes — 20Hz looks identical after interpolation
+/// and cuts egress ~3×. Bumps and `level`/`campaign` events are still sent
+/// immediately (never rate-limited). Set to 1 to broadcast every tick (60Hz)
+/// for debugging.
+const STATE_EVERY: u32 = 3; // 60Hz / 3 = 20Hz
+
 /// Outbound frames are pre-serialized ONCE and shared as `Arc<str>` so a
 /// 10-client room does one JSON encode per tick, not ten.
 type Outbound = Arc<str>;
@@ -143,8 +151,15 @@ async fn game_loop(rooms: Rooms) {
                 } else {
                     handle.idle_ticks = handle.idle_ticks.saturating_add(1);
                 }
+                // State cadence: while active, broadcast at STATE_EVERY (20Hz);
+                // while idle, fall back to the slower keepalive. Bumps and
+                // level/campaign events (in `bumps`) are always sent immediately.
                 let idle = handle.idle_ticks > 1;
-                let send_state = !idle || (handle.idle_ticks % IDLE_KEEPALIVE_EVERY == 0);
+                let send_state = if idle {
+                    handle.idle_ticks % IDLE_KEEPALIVE_EVERY == 0
+                } else {
+                    handle.room.tick % STATE_EVERY == 0
+                };
 
                 // Encode once per room per tick.
                 let mut frames: Vec<Outbound> = Vec::with_capacity(bumps.len() + 1);
@@ -242,9 +257,10 @@ async fn handle_connection(stream: TcpStream, rooms: Rooms) {
                     continue;
                 }
 
-                handle
-                    .room
-                    .add_player(player_id.clone(), name.clone(), color.clone());
+                let my_idx =
+                    handle
+                        .room
+                        .add_player(player_id.clone(), name.clone(), color.clone());
                 handle.clients.insert(player_id.clone(), tx.clone());
                 // A join is motion-worthy: wake the room from idle immediately.
                 handle.idle_ticks = 0;
@@ -254,6 +270,7 @@ async fn handle_connection(stream: TcpStream, rooms: Rooms) {
                     &player_id,
                     &encode(&ServerMsg::PlayerJoin {
                         id: player_id.clone(),
+                        idx: my_idx,
                         name: name.clone(),
                         color: color.clone(),
                     }),
@@ -264,6 +281,7 @@ async fn handle_connection(stream: TcpStream, rooms: Rooms) {
                     &player_id,
                     &encode(&ServerMsg::Welcome {
                         id: player_id.clone(),
+                        idx: my_idx,
                         tick: handle.room.tick,
                     }),
                 );
@@ -275,11 +293,20 @@ async fn handle_connection(stream: TcpStream, rooms: Rooms) {
                             &player_id,
                             &encode(&ServerMsg::PlayerJoin {
                                 id: p.id.clone(),
+                                idx: p.idx,
                                 name: p.name.clone(),
                                 color: p.color.clone(),
                             }),
                         );
                     }
+                }
+
+                // If a campaign is already in progress, send the newcomer the
+                // static level geometry so they can render it (they won't get it
+                // from the per-tick deltas otherwise).
+                if handle.room.has_level() {
+                    let lvl = handle.room.level_message();
+                    handle.send_to(&player_id, &encode(&lvl));
                 }
 
                 current_room = Some(room);
@@ -306,9 +333,13 @@ async fn handle_connection(stream: TcpStream, rooms: Rooms) {
                         // Toggling ready is a meaningful event: wake the room so
                         // the ready state broadcasts promptly.
                         handle.idle_ticks = 0;
-                        // Auto-start the moment every player is ready.
+                        // Auto-start the moment every player is ready. Broadcast
+                        // the one-shot level geometry so all clients can render
+                        // the freshly generated arena.
                         if handle.room.set_ready(&player_id, ready) {
-                            handle.room.start_campaign();
+                            if let Some(level_msg) = handle.room.start_campaign() {
+                                handle.broadcast(&encode(&level_msg));
+                            }
                         }
                     }
                 }

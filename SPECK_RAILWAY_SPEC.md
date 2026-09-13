@@ -117,10 +117,16 @@ Given bodies A and B with a `is_static` flag on B (pillars are static):
 
 1. `tick += 1`
 2. For each player: `integrate(body, input.x*ACCEL, input.y*ACCEL, STEP)`; record `last_seq = input.seq`.
-3. Player↔pillar collisions (static, push player out + reflect). Emit `bump` if `impulse > 30`.
+3. Player↔obstacle collisions (static, push player out + reflect). Emit `bump` if `impulse > 30`.
+   The obstacle set is the base pillars in free-play/lobby, or the **current
+   campaign level's walls** while a campaign is playing (see §3).
 4. Player↔player collisions — O(n²), n ≤ 10. Separate equally, exchange impulse. Emit `bump` if `magnitude > 20`.
 5. Wall collisions per player. Emit `bump` if `hit > 40`.
-6. Build state snapshot and broadcast.
+6. Campaign step (only while playing): enemy AI + collisions, item pickups,
+   and level progression (see §3). Emit `bump` (`other:"enemy"`) on hard hits.
+7. Build state snapshot and broadcast (at the reduced `state` cadence, §2.5).
+
+The simulation always steps at 60Hz. Broadcast cadence is decoupled — see §2.5.
 
 ---
 
@@ -130,41 +136,155 @@ The transport is a single WebSocket carrying JSON text frames. Every message has
 discriminant field `t`. This contract is what binds the two services and MUST match
 exactly on both sides.
 
+> **Protocol version: v2 (egress-optimized).** Compared to the original v1 the
+> per-tick state is compact and index-keyed, static level geometry is sent once,
+> enemy/item updates are deltas, and `state` broadcasts at a reduced cadence.
+> These changes cut room egress by roughly 25–30× for a full campaign room. v2
+> is **not** wire-compatible with v1 — both services must speak v2.
+
 ### 2.1 Client → Server
 
 | `t`      | Fields                          | Notes                                                |
 |----------|---------------------------------|------------------------------------------------------|
-| `join`   | `room: string`, `name: string`, `color: string` | Join/switch room. Leaving current room first. |
+| `join`   | `room: string`, `name: string`, `color: string` | Join/switch room. Leaves current room first. |
 | `input`  | `x: f64`, `y: f64`, `seq: u32`  | Normalized direction (magnitude ≤ 1). `seq` monotonic. |
 | `leave`  | —                               | Leave current room.                                  |
 | `ping`   | `ts: u64`                       | Latency probe (client timestamp, ms).                |
+| `ready`  | `ready: bool`                   | Toggle campaign ready. All-ready → auto-start (§3).  |
 
 ### 2.2 Server → Client
 
-| `t`             | Fields                                   | Notes                                       |
-|-----------------|------------------------------------------|---------------------------------------------|
-| `welcome`       | `id: string`, `tick: u32`                | Assigns this client its player id.          |
-| `state`         | `tick: u32`, `players: PlayerState[]`    | Full snapshot, broadcast **every tick (60Hz)**. |
-| `player_join`   | `id`, `name`, `color`                    | Someone joined (also replayed to newcomer). |
-| `player_leave`  | `id`                                     | Someone left. (`id="full"` = room full.)    |
-| `pong`          | `ts: u64`                                | Echo of `ping.ts` for RTT.                  |
-| `bump`          | `id`, `other`, `impulse: f64`            | Collision event for audio/VFX only.         |
+| `t`             | Fields                                              | Notes                                                        |
+|-----------------|-----------------------------------------------------|--------------------------------------------------------------|
+| `welcome`       | `id: string`, `idx: u8`, `tick: u32`                | Assigns this client its player id **and per-room index**.    |
+| `state`         | `tick: u32`, `players: PlayerState[]`, `campaign?`  | Per-tick snapshot; broadcast at the reduced cadence (§2.5).  |
+| `level`         | `index, levels, walls[], enemies[], items[], exit`  | **One-shot** static level geometry (§2.4). Not repeated.     |
+| `campaign`      | `phase: string`, `level: u8`                        | Phase edge trigger (victory / lobby reset). Level starts use `level`. |
+| `player_join`   | `id`, `idx: u8`, `name`, `color`                    | Someone joined (also replayed to newcomer). Carries `idx`.   |
+| `player_leave`  | `id`                                                | Someone left. (`id="full"` = room full.)                     |
+| `pong`          | `ts: u64`                                           | Echo of `ping.ts` for RTT.                                   |
+| `bump`          | `id`, `other`, `impulse: f64`                       | Collision event for audio/VFX only. `other` ∈ {peer id, `"pillar"`, `"wall"`, `"enemy"`}. |
 
-### 2.3 `PlayerState`
+### 2.3 `PlayerState` (compact, index-keyed)
+
+Identity (`name`/`color`) is sent **once** via `welcome`/`player_join` and joined
+client-side by index. Per-tick state is minimal — single-letter fields, whole
+world-unit integers (sub-pixel precision is invisible after interpolation):
 
 ```json
-{ "id": "uuid", "name": "Player", "color": "#E07A5F",
-  "x": 900.0, "y": 600.0, "vx": 120.5, "vy": -45.2, "seq": 142 }
+{ "i": 0, "x": 900, "y": 600, "vx": 120, "vy": -45, "q": 142, "r": false }
 ```
 
-`seq` = last input sequence the server processed for that player. The client uses it
-to discard acknowledged predicted inputs and replay the rest.
+| Field | Meaning                                                        |
+|-------|----------------------------------------------------------------|
+| `i`   | Per-room player index (matches `welcome.idx` / `player_join.idx`). |
+| `x`,`y` | Position, integer world units.                               |
+| `vx`,`vy` | Velocity, integer world units/sec.                         |
+| `q`   | Last input `seq` the server processed (reconciliation).        |
+| `r`   | Campaign ready flag (meaningful in lobby).                     |
 
-### 2.4 Serde tagging note
+The client keeps a map `idx → {id, name, color}` from join messages, and a map
+`idx → {x, y, vx, vy, q, ready}` from `state`. `q` drives prediction: discard
+acknowledged predicted inputs (`seq <= q`) and replay the rest.
+
+### 2.4 `level` (one-shot static geometry) and campaign deltas
+
+Static level geometry is expensive and never changes during a level, so it is sent
+**once** — on level start (broadcast) and to any client that joins mid-level — via
+`level`, then never repeated:
+
+```json
+{ "t": "level", "index": 0, "levels": 3,
+  "walls":   [ { "i": 0, "x": 1100, "y": 600, "r": 37 }, ... ],
+  "enemies": [ { "i": 0, "x": 800, "y": 400, "r": 26, "hp": 2 }, ... ],
+  "items":   [ { "i": 0, "x": 500, "y": 900 }, ... ],
+  "exit":    { "x": 1604, "y": 1015, "r": 130 } }
+```
+
+Per-tick, the `state.campaign` block carries only what changed — never geometry:
+
+```json
+{ "phase": "playing", "level": 0, "in_zone": 1, "total": 2,
+  "enemies": [ { "i": 0, "x": 812, "y": 418, "d": false } ],
+  "items":   [ 2 ] }
+```
+
+- `campaign.enemies` — enemies that moved ≥1 unit or changed alive-state, keyed by
+  `i`; `d:true` marks a just-killed enemy. Omitted when empty.
+- `campaign.items` — indices (`i`) of items collected this tick. Omitted when empty.
+- `in_zone` / `total` — players inside the exit zone / total, for progression UI.
+
+The client applies these onto the cached `level` maps. Walls/exit stay as first
+received.
+
+### 2.5 Broadcast cadence
+
+The simulation runs at 60Hz, but `state` is broadcast at a **reduced cadence**
+(`STATE_EVERY` ticks; default 20Hz) because clients interpolate remote players
+~90ms behind real time — 60Hz snapshots would be indistinguishable after
+interpolation. `bump`, `level`, and `campaign` messages are **never** rate-limited;
+they are sent the instant they occur. When a room goes fully idle it falls back to
+an even slower keepalive (`IDLE_KEEPALIVE_EVERY`). The **local** player still
+predicts at 60Hz, so self-motion stays crisp regardless of snapshot rate.
+
+### 2.6 Serde tagging note
 
 Rust uses `#[serde(tag = "t")]` with `#[serde(rename = "...")]` per variant, so the
 JSON field is `t` and the value is the lowercase message name. Keep exactly these
-string values.
+string values. Optional fields use `#[serde(skip_serializing_if = ...)]` — a missing
+field means "unchanged / empty", not `null`.
+
+---
+
+## 3. Campaign mode (co-op level progression)
+
+A room is either in free-play or running a **campaign**: a short co-op run through
+`CAMPAIGN_LEVELS` (=3) procedurally generated levels. It is a client-visible layer
+on top of the same authoritative physics — no separate simulation.
+
+### 3.1 Phases & flow
+
+```
+Lobby ──(all players ready)──▶ Playing(level 0) ─▶ … ─▶ Playing(level N-1) ─▶ Victory
+  ▲                                                                              │
+  └──────────────────────── ready up again ─────────────────────────────────────┘
+```
+
+- **Auto-start:** when every player in the room has toggled `ready`, the campaign
+  starts immediately (no host/host-start step). Ready-up works from both Lobby and
+  Victory (to run again).
+- **Progress:** a level clears when **all enemies are dead AND every player is
+  inside the exit zone simultaneously**. Then the next level loads (a new `level`
+  message is broadcast), or the run ends in **Victory**.
+- **No player death:** players cannot lose; a room can only progress. Ready flags
+  reset on victory and when the room empties (→ Lobby).
+
+### 3.2 Level contents (procedural, seeded)
+
+Each level is generated from a per-run seed (reproducible within a run, different
+between runs). Difficulty scales with level index:
+
+| Entity   | Behaviour                                                              | L0 / L1 / L2 |
+|----------|-----------------------------------------------------------------------|--------------|
+| Walls    | Static obstacles; reuse the player↔static collision path (§1.3).       | 4 / 6 / 8    |
+| Enemies  | Slow chasers, capped below player speed. **Bump-to-damage** (`impulse > 55` → −1 hp). | count 3 / 5 / 7, hp 2 / 3 / 4 |
+| Items    | Static pickups, collected on player overlap.                          | 5 / 4 / 3    |
+| Exit     | Shared zone all players must gather in (with enemies cleared) to advance. | 1 (rotates corners) |
+
+Placement rejection-samples against keep-out zones (the spawn ring and the exit) so
+levels stay solvable. All entity/geometry values are integer world units on the wire.
+
+### 3.3 Cost model
+
+Campaign work stays within the existing per-tick envelope: enemy AI and item checks
+are O(enemies · players), both ≤ ~10. Levels are generated **once per transition**
+into reused buffers (no hot-loop allocation). While playing, the room stays at 60Hz
+sim (enemies always move) but still broadcasts `state` at the reduced §2.5 cadence.
+
+> Shared campaign constants (enemy/item radii, hit impulse, exit radius) live in the
+> backend today. When the real frontend renders these entities it should mirror them
+> the same way §0 constants are mirrored — treat them as an extension of the §0
+> single-source-of-truth contract.
 
 ---
 
@@ -229,10 +349,11 @@ server-rs/
 ### `protocol.rs`
 - `ClientMsg` (`#[derive(Deserialize)] #[serde(tag="t")]`): `Join{room,name,color}`,
   `Input{x,y,seq}`, `Leave`, `Ping{ts}`.
-- `ServerMsg` (`#[derive(Serialize, Clone)] #[serde(tag="t")]`): `Welcome{id,tick}`,
-  `State{tick,players}`, `PlayerJoin{id,name,color}`, `PlayerLeave{id}`, `Pong{ts}`,
-  `Bump{id,other,impulse}`.
-- `PlayerState { id, name, color, x, y, vx, vy, seq }`.
+- `ServerMsg` (`#[derive(Serialize, Clone)] #[serde(tag="t")]`): `Welcome{id,idx,tick}`,
+  `State{tick,players,campaign?}`, `Level{index,levels,walls,enemies,items,exit}`,
+  `Campaign{phase,level}`, `PlayerJoin{id,idx,name,color}`, `PlayerLeave{id}`,
+  `Pong{ts}`, `Bump{id,other,impulse}` (see §2).
+- `PlayerState { i, x, y, vx, vy, q, r }` — compact/index-keyed (§2.3).
 
 ### `room.rs`
 - `Room { id, players: HashMap<String,Player>, pillars: Vec<Body>, tick: u32, ... }`
@@ -335,7 +456,8 @@ restartPolicyType = "ALWAYS"
 ### Backend acceptance checklist
 
 - Container listens on the injected port on `0.0.0.0`.
-- WS handshake succeeds; a `join` yields a `welcome` then a stream of `state` at ~60/s.
+- WS handshake succeeds; a `join` yields a `welcome` then a stream of `state` at the
+  reduced cadence (~20/s active; §2.5).
 - Two clients in the same room see each other and collide.
 - Empty rooms are reclaimed; server survives client churn without leaking tasks.
 
