@@ -25,3 +25,13 @@ in the full frontend (MVP-2b).
 - No prediction/reconciliation here — just render server truth directly. Movement
   will show ~1 RTT of lag; that's expected and fine for a connectivity test.
 - Physics constants (arena, pillars) copied from spec §0 for correct rendering.
+
+## Mobile support (added)
+- Viewport meta: maximum-scale=1, user-scalable=no, viewport-fit=cover (safe areas).
+- `touch-action: none` on body/canvas/stick → no scroll/zoom while dragging.
+- Virtual joystick (bottom-left), shown when `(pointer: coarse)` or `ontouchstart`.
+  Pointer events, magnitude-proportional (analog) output, 0.12 dead zone.
+  Server preserves sub-unit magnitude (only normalizes when >1) → analog speed.
+- HUD compacts under 520px; hint hidden. Default server = Railway when not on localhost.
+- Verified: JS `node --check` passes; served file (HTTP 200) contains joystick markup.
+  Full on-device touch test is a manual step for the user.

@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
 <title>Speck — Thin WS Tester (MVP-2a)</title>
 <style>
   :root { color-scheme: dark; }
@@ -12,6 +12,10 @@
     background: #0e0f13; color: #e8e8ea;
     font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
     overflow: hidden;
+    /* Stop the browser from scrolling/zooming when dragging on the canvas/stick. */
+    touch-action: none;
+    -webkit-user-select: none; user-select: none;
+    -webkit-tap-highlight-color: transparent;
   }
   #hud {
     position: fixed; top: 10px; left: 10px; z-index: 10;
@@ -34,7 +38,39 @@
   }
   button:hover { filter: brightness(1.1); }
   #hint { margin-top: 8px; color: #8b8f9a; font-size: 11px; }
-  canvas { display: block; width: 100vw; height: 100vh; }
+  canvas { display: block; width: 100vw; height: 100vh; touch-action: none; }
+
+  /* Compact the HUD on small screens so it never overflows a phone. */
+  #hud {
+    top: calc(8px + env(safe-area-inset-top));
+    left: calc(8px + env(safe-area-inset-left));
+  }
+  @media (max-width: 520px) {
+    #hud { font-size: 12px; max-width: min(88vw, 320px); padding: 8px 10px; }
+    #hint { display: none; }
+  }
+
+  /* Virtual joystick — only shown on touch devices (toggled via JS). */
+  #stick {
+    position: fixed;
+    left: calc(24px + env(safe-area-inset-left));
+    bottom: calc(24px + env(safe-area-inset-bottom));
+    width: 132px; height: 132px; z-index: 20;
+    border-radius: 50%;
+    background: rgba(40,44,54,0.35);
+    border: 1px solid rgba(126,178,221,0.35);
+    display: none;
+    touch-action: none;
+  }
+  #stick.active { display: block; }
+  #knob {
+    position: absolute; left: 50%; top: 50%;
+    width: 58px; height: 58px; margin: -29px 0 0 -29px;
+    border-radius: 50%;
+    background: rgba(126,178,221,0.9);
+    box-shadow: 0 2px 12px rgba(0,0,0,0.4);
+    pointer-events: none;
+  }
 </style>
 </head>
 <body>
@@ -56,6 +92,7 @@
   <div id="hint">WASD / arrow keys to move. Open two tabs in the same room to test collisions.</div>
 </div>
 <canvas id="c"></canvas>
+<div id="stick"><div id="knob"></div></div>
 <script type="module">
 // ---- Shared constants (spec §0) — for rendering only ----
 const ARENA_W = 1800, ARENA_H = 1200;
@@ -110,26 +147,43 @@ function setStatus(text, cls) {
   const el = $("status"); el.textContent = text; el.className = cls;
 }
 
+function teardown(socket) {
+  // Detach handlers so this socket's async close/error can't touch app state
+  // or trigger reconnect. Then close it quietly.
+  if (!socket) return;
+  socket.onopen = socket.onmessage = socket.onclose = socket.onerror = null;
+  try { socket.close(); } catch {}
+}
+
 function connect() {
-  if (ws) { explicitClose = true; try { ws.close(); } catch {} }
+  // Cleanly retire any previous socket before opening a new one.
+  teardown(ws);
   explicitClose = false;
   const url = $("server").value.trim();
   const room = $("room").value.trim() || "smoke";
   const name = $("name").value.trim() || "Web";
   const color = $("color").value.trim() || "#E07A5F";
   setStatus("connecting…", "wait");
-  try { ws = new WebSocket(url); } catch (e) { setStatus("bad url", "bad"); return; }
 
-  ws.addEventListener("open", () => {
+  let sock;
+  try { sock = new WebSocket(url); } catch (e) { setStatus("bad url", "bad"); return; }
+  ws = sock;
+
+  // Guard: only act if this socket is still the current one.
+  const isCurrent = () => ws === sock;
+
+  sock.addEventListener("open", () => {
+    if (!isCurrent()) return;
     setStatus("connected", "ok");
-    ws.send(JSON.stringify({ t: "join", room, name, color }));
+    sock.send(JSON.stringify({ t: "join", room, name, color }));
     clearInterval(pingTimer);
     pingTimer = setInterval(() => {
-      if (ws && ws.readyState === 1) ws.send(JSON.stringify({ t: "ping", ts: Date.now() }));
+      if (isCurrent() && sock.readyState === 1) sock.send(JSON.stringify({ t: "ping", ts: Date.now() }));
     }, 2000);
   });
 
-  ws.addEventListener("message", (ev) => {
+  sock.addEventListener("message", (ev) => {
+    if (!isCurrent()) return;
     let msg; try { msg = JSON.parse(ev.data); } catch { return; }
     switch (msg.t) {
       case "welcome": selfId = msg.id; joined = true; setStatus("joined", "ok"); break;
@@ -144,18 +198,20 @@ function connect() {
     }
   });
 
-  ws.addEventListener("close", (ev) => {
+  sock.addEventListener("close", (ev) => {
+    if (!isCurrent()) return;   // a retired socket closing — ignore
     joined = false; players = [];
     clearInterval(pingTimer);
     console.warn("[speck] socket closed", { code: ev.code, reason: ev.reason, wasClean: ev.wasClean, url });
     if (!explicitClose) {
       setStatus(`reconnecting… (closed ${ev.code})`, "wait");
-      setTimeout(connect, 1000);
+      setTimeout(() => { if (isCurrent()) connect(); }, 1000);
     } else {
       setStatus("disconnected", "bad");
     }
   });
-  ws.addEventListener("error", (ev) => {
+  sock.addEventListener("error", (ev) => {
+    if (!isCurrent()) return;   // a retired socket erroring — ignore
     console.error("[speck] socket error connecting to", url, ev);
     setStatus("error — see console (F12)", "bad");
   });
@@ -170,6 +226,53 @@ addEventListener("keydown", (e) => {
 });
 addEventListener("keyup", (e) => keys.delete(e.key.toLowerCase()));
 
+// ---- Touch joystick -> normalized {x,y} ----
+const stickEl = $("stick");
+const knobEl = $("knob");
+const stick = { active: false, id: null, x: 0, y: 0 };
+const STICK_RADIUS = 66;   // half of the 132px pad
+const STICK_DEAD = 0.12;   // dead zone to avoid jitter
+
+const isTouch = matchMedia("(pointer: coarse)").matches || "ontouchstart" in window;
+if (isTouch) stickEl.classList.add("active");
+
+function updateKnob(dx, dy) {
+  knobEl.style.transform = `translate(${dx}px, ${dy}px)`;
+}
+function resetStick() {
+  stick.active = false; stick.id = null; stick.x = 0; stick.y = 0;
+  updateKnob(0, 0);
+}
+stickEl.addEventListener("pointerdown", (e) => {
+  e.preventDefault();
+  stick.active = true; stick.id = e.pointerId;
+  stickEl.setPointerCapture(e.pointerId);
+  handleStickMove(e);
+});
+stickEl.addEventListener("pointermove", (e) => {
+  if (stick.active && e.pointerId === stick.id) { e.preventDefault(); handleStickMove(e); }
+});
+const endStick = (e) => { if (e.pointerId === stick.id) resetStick(); };
+stickEl.addEventListener("pointerup", endStick);
+stickEl.addEventListener("pointercancel", endStick);
+
+function handleStickMove(e) {
+  const rect = stickEl.getBoundingClientRect();
+  const cx = rect.left + rect.width / 2;
+  const cy = rect.top + rect.height / 2;
+  let dx = e.clientX - cx;
+  let dy = e.clientY - cy;
+  const dist = Math.hypot(dx, dy);
+  const clamped = Math.min(dist, STICK_RADIUS);
+  const ux = dist > 0 ? dx / dist : 0;
+  const uy = dist > 0 ? dy / dist : 0;
+  updateKnob(ux * clamped, uy * clamped);
+  // Normalized output in [-1,1], magnitude proportional to displacement.
+  const frac = clamped / STICK_RADIUS;
+  stick.x = frac < STICK_DEAD ? 0 : ux * frac;
+  stick.y = frac < STICK_DEAD ? 0 : uy * frac;
+}
+
 let lastNonZero = false;
 function sampleAndSendInput() {
   let x = 0, y = 0;
@@ -177,6 +280,10 @@ function sampleAndSendInput() {
   if (keys.has("d") || keys.has("arrowright")) x += 1;
   if (keys.has("w") || keys.has("arrowup")) y -= 1;
   if (keys.has("s") || keys.has("arrowdown")) y += 1;
+  // Joystick overrides/augments keyboard when engaged.
+  if (stick.active && (stick.x !== 0 || stick.y !== 0)) {
+    x = stick.x; y = stick.y;
+  }
   const mag = Math.hypot(x, y);
   if (mag > 1) { x /= mag; y /= mag; }
   const nonZero = mag > 0;

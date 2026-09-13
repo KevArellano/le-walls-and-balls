@@ -24,3 +24,15 @@ Frontend is a separate MVP (see MVP-2 files). Minimal resource usage throughout.
 - Bumps are broadcast to the whole room for MVP (spec implies targeted; harmless,
   frontend filters by self id). Revisit only if it shows up as bandwidth cost.
 - Server is fully stateless (rooms in memory, ephemeral). No DB, no volumes.
+
+## Load verification (10 concurrent + private rooms)
+- `load-test.mjs`: spawns N clients in one room, all sending directional input so
+  bodies collide; verifies all N appear in a snapshot, state rate holds, and an
+  11th client is rejected `player_leave id:"full"`.
+- Local (`ws://localhost:3000`, room `load-e7c08`): 10/10 connected, 10 in snapshot,
+  60.4Hz, 11th rejected → PASS.
+- Railway (`wss://...`, private room `priv-DEMO42`): 10/10 connected, 10 in snapshot,
+  60.5Hz, 11th rejected → PASS.
+- Private rooms: server keys rooms by the `join.room` string, created on demand and
+  reclaimed when empty. No server-side public/private distinction — any code is a
+  private room. `MAX_PLAYERS=10` enforced per room.
