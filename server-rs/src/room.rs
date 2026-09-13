@@ -194,11 +194,26 @@ impl Room {
             self.id_buf.push(id.clone());
         }
 
-        // 3. Player ↔ pillar collisions (static). Emit bump if impulse > 30.
+        // 3. Player ↔ static-obstacle collisions. During a campaign the level's
+        //    generated walls are the obstacles; otherwise the base pillars are.
+        //    Emit bump if impulse > 30.
+        //
+        //    Borrow note: take the level's walls out via a swap so we can mutate
+        //    players and read walls at once, then restore. Walls are static so
+        //    they aren't mutated; the swap is just to satisfy the borrow checker
+        //    without cloning the wall vec each tick.
+        let mut obstacles: Vec<Body> = if self.phase == Phase::Playing {
+            match self.level.as_mut() {
+                Some(l) => std::mem::take(&mut l.walls),
+                None => std::mem::take(&mut self.pillars),
+            }
+        } else {
+            std::mem::take(&mut self.pillars)
+        };
         for id in self.id_buf.iter() {
             if let Some(p) = self.players.get_mut(id) {
-                for pillar in self.pillars.iter_mut() {
-                    let mag = resolve_circle_circle(&mut p.body, pillar);
+                for obstacle in obstacles.iter_mut() {
+                    let mag = resolve_circle_circle(&mut p.body, obstacle);
                     if mag > 30.0 {
                         bumps.push(ServerMsg::Bump {
                             id: id.clone(),
@@ -208,6 +223,12 @@ impl Room {
                     }
                 }
             }
+        }
+        // Restore the borrowed obstacle vec to its owner.
+        if self.phase == Phase::Playing && self.level.is_some() {
+            self.level.as_mut().unwrap().walls = obstacles;
+        } else {
+            self.pillars = std::mem::take(&mut obstacles);
         }
 
         // 4. Player ↔ player collisions — O(n²), n ≤ 10. Emit bump if magnitude > 20.

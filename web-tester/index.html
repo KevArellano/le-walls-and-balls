@@ -164,10 +164,19 @@ function resolvePillarBody(b, px, py, pr) {
   b.vy -= impulse * ny;
 }
 
-// Advance a predicted self body by one input frame.
+// Advance a predicted self body by one input frame. Collides against whatever
+// obstacles are authoritative RIGHT NOW: the campaign level's walls while
+// playing, otherwise the base pillars. This must match the server's step 3
+// (room.rs) or the self dot ghosts through walls and rubber-bands.
+function activeObstacles() {
+  if (campaign && campaign.phase === "playing" && campaign.walls.length) {
+    return campaign.walls.map((w) => [w.x, w.y, w.r]);
+  }
+  return PILLARS;
+}
 function stepSelf(b, input, dt) {
   integrateBody(b, input.x * ACCEL, input.y * ACCEL, dt);
-  for (const [px, py, pr] of PILLARS) resolvePillarBody(b, px, py, pr);
+  for (const [px, py, pr] of activeObstacles()) resolvePillarBody(b, px, py, pr);
   resolveWallsBody(b);
 }
 
