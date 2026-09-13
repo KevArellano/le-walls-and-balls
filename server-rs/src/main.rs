@@ -19,10 +19,28 @@ use uuid::Uuid;
 
 const STEP_DURATION: Duration = Duration::from_nanos(1_000_000_000 / 60);
 
+/// After a room goes fully quiet (no input, everyone at rest), keep sending
+/// state at this reduced cadence so late-arriving clients still get a snapshot
+/// and connections stay warm — without paying 60Hz for a static scene.
+const IDLE_KEEPALIVE_EVERY: u32 = 30; // ~2 snapshots/sec while idle
+
+/// Outbound frames are pre-serialized ONCE and shared as `Arc<str>` so a
+/// 10-client room does one JSON encode per tick, not ten.
+type Outbound = Arc<str>;
+
+fn encode(msg: &ServerMsg) -> Outbound {
+    // Serialization of our own types never fails; fall back defensively.
+    serde_json::to_string(msg)
+        .unwrap_or_else(|_| String::from("{}"))
+        .into()
+}
+
 /// A room plus the outbound channels for every connected client in it.
 struct RoomHandle {
     room: Room,
-    clients: HashMap<String, UnboundedSender<ServerMsg>>,
+    clients: HashMap<String, UnboundedSender<Outbound>>,
+    /// Ticks elapsed since the room last had any motion/input.
+    idle_ticks: u32,
 }
 
 impl RoomHandle {
@@ -30,26 +48,28 @@ impl RoomHandle {
         RoomHandle {
             room: Room::new(id),
             clients: HashMap::new(),
+            idle_ticks: 0,
         }
     }
 
-    fn broadcast(&self, msg: &ServerMsg) {
+    /// Broadcast an already-encoded frame (cheap Arc clone per client).
+    fn broadcast(&self, frame: &Outbound) {
         for tx in self.clients.values() {
-            let _ = tx.send(msg.clone());
+            let _ = tx.send(frame.clone());
         }
     }
 
-    fn broadcast_except(&self, except: &str, msg: &ServerMsg) {
+    fn broadcast_except(&self, except: &str, frame: &Outbound) {
         for (id, tx) in self.clients.iter() {
             if id != except {
-                let _ = tx.send(msg.clone());
+                let _ = tx.send(frame.clone());
             }
         }
     }
 
-    fn send_to(&self, id: &str, msg: &ServerMsg) {
+    fn send_to(&self, id: &str, frame: &Outbound) {
         if let Some(tx) = self.clients.get(id) {
-            let _ = tx.send(msg.clone());
+            let _ = tx.send(frame.clone());
         }
     }
 }
@@ -80,6 +100,10 @@ async fn main() {
     loop {
         match listener.accept().await {
             Ok((stream, _peer)) => {
+                // Disable Nagle's algorithm: send small frames immediately
+                // instead of coalescing them. Critical for real-time input/state
+                // latency — Nagle can add tens of ms per frame.
+                let _ = stream.set_nodelay(true);
                 let rooms = rooms.clone();
                 tokio::spawn(handle_connection(stream, rooms));
             }
@@ -88,15 +112,15 @@ async fn main() {
     }
 }
 
-/// Fixed 60Hz loop: tick every room, collect outbound messages, then send
+/// Fixed 60Hz loop: tick every room, collect outbound frames, then send
 /// AFTER releasing the write lock (spec §B3 game_loop, pitfall §10).
 async fn game_loop(rooms: Rooms) {
     let mut next = Instant::now();
     loop {
         next += STEP_DURATION;
 
-        // Outbound (room_id -> messages) collected under the lock, sent after.
-        let mut outbound: Vec<(String, Vec<ServerMsg>)> = Vec::new();
+        // Outbound (room_id -> pre-encoded frames) collected under the lock.
+        let mut outbound: Vec<(String, Vec<Outbound>)> = Vec::new();
         let mut empty_rooms: Vec<String> = Vec::new();
 
         {
@@ -106,26 +130,46 @@ async fn game_loop(rooms: Rooms) {
                     empty_rooms.push(room_id.clone());
                     continue;
                 }
-                let mut msgs = handle.room.tick();
-                msgs.push(handle.room.state_snapshot());
-                outbound.push((room_id.clone(), msgs));
+
+                let bumps = handle.room.tick();
+
+                // Idle detection: a room is "active" this tick if anything
+                // happened (a bump) or any body is still moving. Otherwise we
+                // back off to a low keepalive cadence to save CPU/bandwidth.
+                let moving = handle.room.any_motion();
+                if !bumps.is_empty() || moving {
+                    handle.idle_ticks = 0;
+                } else {
+                    handle.idle_ticks = handle.idle_ticks.saturating_add(1);
+                }
+                let idle = handle.idle_ticks > 1;
+                let send_state = !idle || (handle.idle_ticks % IDLE_KEEPALIVE_EVERY == 0);
+
+                // Encode once per room per tick.
+                let mut frames: Vec<Outbound> = Vec::with_capacity(bumps.len() + 1);
+                for b in &bumps {
+                    frames.push(encode(b));
+                }
+                if send_state {
+                    frames.push(encode(&handle.room.state_snapshot()));
+                }
+
+                if !frames.is_empty() {
+                    outbound.push((room_id.clone(), frames));
+                }
             }
             for id in &empty_rooms {
                 guard.remove(id);
             }
-        } // lock released here
+        } // write lock released here
 
-        // Send after releasing the lock.
+        // Send after releasing the write lock (never send while write-locked).
         {
             let guard = rooms.read().await;
-            for (room_id, msgs) in outbound {
+            for (room_id, frames) in outbound {
                 if let Some(handle) = guard.get(&room_id) {
-                    for msg in msgs {
-                        match &msg {
-                            // Bumps target one player; state broadcasts to all.
-                            ServerMsg::Bump { .. } => handle.broadcast(&msg),
-                            _ => handle.broadcast(&msg),
-                        }
+                    for frame in &frames {
+                        handle.broadcast(frame);
                     }
                 }
             }
@@ -151,15 +195,12 @@ async fn handle_connection(stream: TcpStream, rooms: Rooms) {
     let player_id = Uuid::new_v4().to_string();
     let (mut ws_tx, mut ws_rx) = ws.split();
 
-    // Outbound channel drained by a forward task.
-    let (tx, mut rx) = unbounded_channel::<ServerMsg>();
+    // Outbound channel drained by a forward task. Frames arrive pre-serialized.
+    let (tx, mut rx) = unbounded_channel::<Outbound>();
     let forward = tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            let text = match serde_json::to_string(&msg) {
-                Ok(t) => t,
-                Err(_) => continue,
-            };
-            if ws_tx.send(Message::Text(text)).await.is_err() {
+        while let Some(frame) = rx.recv().await {
+            // frame is already JSON; no per-client serialization here.
+            if ws_tx.send(Message::Text(frame.to_string())).await.is_err() {
                 break;
             }
         }
@@ -194,32 +235,36 @@ async fn handle_connection(stream: TcpStream, rooms: Rooms) {
                     .or_insert_with(|| RoomHandle::new(room.clone()));
 
                 if handle.room.is_full() {
-                    handle.send_to_direct(&tx, &ServerMsg::PlayerLeave {
+                    let _ = tx.send(encode(&ServerMsg::PlayerLeave {
                         id: "full".to_string(),
-                    });
+                    }));
                     continue;
                 }
 
-                handle.room.add_player(player_id.clone(), name.clone(), color.clone());
+                handle
+                    .room
+                    .add_player(player_id.clone(), name.clone(), color.clone());
                 handle.clients.insert(player_id.clone(), tx.clone());
+                // A join is motion-worthy: wake the room from idle immediately.
+                handle.idle_ticks = 0;
 
                 // Notify others.
                 handle.broadcast_except(
                     &player_id,
-                    &ServerMsg::PlayerJoin {
+                    &encode(&ServerMsg::PlayerJoin {
                         id: player_id.clone(),
                         name: name.clone(),
                         color: color.clone(),
-                    },
+                    }),
                 );
 
                 // Welcome the newcomer.
                 handle.send_to(
                     &player_id,
-                    &ServerMsg::Welcome {
+                    &encode(&ServerMsg::Welcome {
                         id: player_id.clone(),
                         tick: handle.room.tick,
-                    },
+                    }),
                 );
 
                 // Replay existing players to the newcomer.
@@ -227,11 +272,11 @@ async fn handle_connection(stream: TcpStream, rooms: Rooms) {
                     if p.id != player_id {
                         handle.send_to(
                             &player_id,
-                            &ServerMsg::PlayerJoin {
+                            &encode(&ServerMsg::PlayerJoin {
                                 id: p.id.clone(),
                                 name: p.name.clone(),
                                 color: p.color.clone(),
-                            },
+                            }),
                         );
                     }
                 }
@@ -243,6 +288,8 @@ async fn handle_connection(stream: TcpStream, rooms: Rooms) {
                     let mut guard = rooms.write().await;
                     if let Some(handle) = guard.get_mut(room_id) {
                         handle.room.set_input(&player_id, x, y, seq);
+                        // Input is motion: wake the room so state resumes 60Hz.
+                        handle.idle_ticks = 0;
                     }
                 }
             }
@@ -252,7 +299,8 @@ async fn handle_connection(stream: TcpStream, rooms: Rooms) {
                 }
             }
             ClientMsg::Ping { ts } => {
-                let _ = tx.send(ServerMsg::Pong { ts });
+                // Reply immediately, bypassing the game loop.
+                let _ = tx.send(encode(&ServerMsg::Pong { ts }));
             }
         }
     }
@@ -269,16 +317,8 @@ async fn leave_room(rooms: &Rooms, room_id: &str, player_id: &str) {
     if let Some(handle) = guard.get_mut(room_id) {
         handle.room.remove_player(player_id);
         handle.clients.remove(player_id);
-        handle.broadcast(&ServerMsg::PlayerLeave {
+        handle.broadcast(&encode(&ServerMsg::PlayerLeave {
             id: player_id.to_string(),
-        });
-    }
-}
-
-impl RoomHandle {
-    /// Send directly to a channel not yet registered in `clients`
-    /// (used to reject a join when the room is full).
-    fn send_to_direct(&self, tx: &UnboundedSender<ServerMsg>, msg: &ServerMsg) {
-        let _ = tx.send(msg.clone());
+        }));
     }
 }

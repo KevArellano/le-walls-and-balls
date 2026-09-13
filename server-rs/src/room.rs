@@ -56,6 +56,18 @@ impl Room {
         self.players.is_empty()
     }
 
+    /// True if any player is still moving or has pending input. Used by the
+    /// game loop to back off broadcasting when the whole room is at rest.
+    pub fn any_motion(&self) -> bool {
+        const REST_SPEED_SQ: f64 = 1.0; // < 1 unit/sec is effectively stopped
+        self.players.values().any(|p| {
+            let has_input = p.input.x != 0.0 || p.input.y != 0.0;
+            let v = &p.body.vel;
+            let speed_sq = v.x * v.x + v.y * v.y;
+            has_input || speed_sq > REST_SPEED_SQ
+        })
+    }
+
     /// Add a player at a spawn position on the ring of radius 200 (spec §0).
     pub fn add_player(&mut self, id: String, name: String, color: String) {
         let index = self.players.len();

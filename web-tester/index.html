@@ -94,15 +94,75 @@
 <canvas id="c"></canvas>
 <div id="stick"><div id="knob"></div></div>
 <script type="module">
-// ---- Shared constants (spec §0) — for rendering only ----
+// ---- Shared constants (spec §0) — MUST match physics.rs exactly ----
 const ARENA_W = 1800, ARENA_H = 1200;
 const PLAYER_R = 22;
+const MAX_SPEED = 460;
+const ACCEL = 1650;
+const FRICTION = 2.35;
+const RESTITUTION = 0.82;
+const STEP = 1 / 60;
+const WALL_PAD = 28;
 const PILLARS = [
   [520, 360, 48], [1280, 360, 48],
   [520, 840, 48], [1280, 840, 48],
   [900, 600, 36],
 ];
 const PALETTE = ["#E07A5F", "#81B29A", "#7EB2DD", "#F2CC8F", "#D4A5A5", "#A7C4A0"];
+
+// ---- Prediction/reconciliation tuning (spec §F4) ----
+const MAX_INPUT_BUFFER = 64;
+const TELEPORT_THRESHOLD = 150;  // px error -> snap
+const CORRECTION_RATE = 0.15;    // px error <= threshold -> ease
+
+// ---- Shared physics (mirror of physics.rs) ----
+function integrateBody(b, ax, ay, dt) {
+  b.vx += ax * dt;
+  b.vy += ay * dt;
+  const speed = Math.hypot(b.vx, b.vy);
+  if (speed > MAX_SPEED) {
+    const s = MAX_SPEED / speed;
+    b.vx *= s; b.vy *= s;
+  }
+  const damp = Math.exp(-FRICTION * dt);
+  b.vx *= damp; b.vy *= damp;
+  b.x += b.vx * dt;
+  b.y += b.vy * dt;
+}
+
+function resolveWallsBody(b) {
+  const minX = WALL_PAD + PLAYER_R, maxX = ARENA_W - WALL_PAD - PLAYER_R;
+  const minY = WALL_PAD + PLAYER_R, maxY = ARENA_H - WALL_PAD - PLAYER_R;
+  if (b.x < minX) { b.x = minX; if (b.vx < 0) b.vx = -b.vx * RESTITUTION; }
+  else if (b.x > maxX) { b.x = maxX; if (b.vx > 0) b.vx = -b.vx * RESTITUTION; }
+  if (b.y < minY) { b.y = minY; if (b.vy < 0) b.vy = -b.vy * RESTITUTION; }
+  else if (b.y > maxY) { b.y = maxY; if (b.vy > 0) b.vy = -b.vy * RESTITUTION; }
+}
+
+// Push self out of a static pillar (B is static: A fully corrected).
+function resolvePillarBody(b, px, py, pr) {
+  const dx = px - b.x, dy = py - b.y;
+  const distSq = dx * dx + dy * dy;
+  const rSum = PLAYER_R + pr;
+  if (distSq >= rSum * rSum || distSq === 0) return;
+  const dist = Math.sqrt(distSq);
+  const nx = dx / dist, ny = dy / dist;
+  const overlap = rSum - dist;
+  b.x -= nx * overlap;
+  b.y -= ny * overlap;
+  const rvn = -(b.vx * nx + b.vy * ny); // rel vel (B static) along normal
+  if (rvn >= 0) return;
+  const impulse = -(1 + RESTITUTION) * rvn;
+  b.vx -= impulse * nx;
+  b.vy -= impulse * ny;
+}
+
+// Advance a predicted self body by one input frame.
+function stepSelf(b, input, dt) {
+  integrateBody(b, input.x * ACCEL, input.y * ACCEL, dt);
+  for (const [px, py, pr] of PILLARS) resolvePillarBody(b, px, py, pr);
+  resolveWallsBody(b);
+}
 
 // ---- Query-param / default config ----
 const params = new URLSearchParams(location.search);
@@ -137,11 +197,47 @@ const wy = (y) => view.oy + y * view.scale;
 
 // ---- Networking (raw WebSocket, no framework) ----
 let ws = null, selfId = null, joined = false, explicitClose = false;
-let players = [];        // latest snapshot
+let players = [];        // latest snapshot (remote truth for other players)
 let inputSeq = 0;
 let stateTimestamps = [];
 let latencyMs = null;
 let pingTimer = null;
+
+// ---- Client-side prediction state (spec §F4) ----
+// The locally predicted self body. Rendered immediately with zero RTT lag.
+let selfPred = null;               // { x, y, vx, vy } or null until first state
+const inputBuffer = [];            // [{ seq, x, y }] sent but maybe unacked
+
+function reconcile(serverSelf) {
+  // First authoritative fix: adopt server state outright.
+  if (!selfPred) {
+    selfPred = { x: serverSelf.x, y: serverSelf.y, vx: serverSelf.vx, vy: serverSelf.vy };
+    // Drop everything acknowledged.
+    while (inputBuffer.length && inputBuffer[0].seq <= serverSelf.seq) inputBuffer.shift();
+    return;
+  }
+
+  // 1. Drop inputs the server has already processed.
+  while (inputBuffer.length && inputBuffer[0].seq <= serverSelf.seq) inputBuffer.shift();
+
+  // 2. Replay unacknowledged inputs from the authoritative state.
+  const replay = { x: serverSelf.x, y: serverSelf.y, vx: serverSelf.vx, vy: serverSelf.vy };
+  for (const inp of inputBuffer) stepSelf(replay, inp, STEP);
+
+  // 3. Compare to current prediction; snap on large error, else ease.
+  const errX = replay.x - selfPred.x;
+  const errY = replay.y - selfPred.y;
+  const err = Math.hypot(errX, errY);
+  if (err > TELEPORT_THRESHOLD) {
+    selfPred.x = replay.x; selfPred.y = replay.y;
+  } else if (err > 0.5) {
+    selfPred.x += errX * CORRECTION_RATE;
+    selfPred.y += errY * CORRECTION_RATE;
+  }
+  // Take server velocity directly (authoritative) to stay convergent.
+  selfPred.vx = replay.vx;
+  selfPred.vy = replay.vy;
+}
 
 function setStatus(text, cls) {
   const el = $("status"); el.textContent = text; el.className = cls;
@@ -186,11 +282,19 @@ function connect() {
     if (!isCurrent()) return;
     let msg; try { msg = JSON.parse(ev.data); } catch { return; }
     switch (msg.t) {
-      case "welcome": selfId = msg.id; joined = true; setStatus("joined", "ok"); break;
+      case "welcome":
+        selfId = msg.id; joined = true; setStatus("joined", "ok");
+        selfPred = null; inputBuffer.length = 0; inputSeq = 0;
+        break;
       case "state":
         players = msg.players;
         stateTimestamps.push(performance.now());
         if (stateTimestamps.length > 90) stateTimestamps.shift();
+        // Reconcile the predicted self dot against server truth.
+        if (selfId) {
+          const me = players.find((p) => p.id === selfId);
+          if (me) reconcile(me);
+        }
         break;
       case "pong": latencyMs = Date.now() - msg.ts; break;
       case "player_leave": if (msg.id === "full") setStatus("room full", "bad"); break;
@@ -242,6 +346,8 @@ function updateKnob(dx, dy) {
 function resetStick() {
   stick.active = false; stick.id = null; stick.x = 0; stick.y = 0;
   updateKnob(0, 0);
+  // Send one stopping frame so the server damps to rest cleanly.
+  if (lastNonZero) { sendInput(0, 0); lastNonZero = false; }
 }
 stickEl.addEventListener("pointerdown", (e) => {
   e.preventDefault();
@@ -273,30 +379,68 @@ function handleStickMove(e) {
   stick.y = frac < STICK_DEAD ? 0 : uy * frac;
 }
 
-let lastNonZero = false;
-function sampleAndSendInput() {
+function readInput() {
   let x = 0, y = 0;
   if (keys.has("a") || keys.has("arrowleft")) x -= 1;
   if (keys.has("d") || keys.has("arrowright")) x += 1;
   if (keys.has("w") || keys.has("arrowup")) y -= 1;
   if (keys.has("s") || keys.has("arrowdown")) y += 1;
-  // Joystick overrides/augments keyboard when engaged.
+  // Joystick overrides keyboard when engaged.
   if (stick.active && (stick.x !== 0 || stick.y !== 0)) {
     x = stick.x; y = stick.y;
   }
   const mag = Math.hypot(x, y);
   if (mag > 1) { x /= mag; y /= mag; }
-  const nonZero = mag > 0;
-  // Send when moving, plus one final zero frame to stop cleanly.
-  if ((nonZero || lastNonZero) && ws && ws.readyState === 1 && joined) {
-    ws.send(JSON.stringify({ t: "input", x, y, seq: inputSeq++ }));
-  }
+  return { x, y };
+}
+
+// Send one input frame AND advance the local prediction by one step so the
+// self dot reacts instantly (spec §F4). Records the frame for reconciliation.
+function sendInput(x, y) {
+  if (!(ws && ws.readyState === 1 && joined)) return;
+  const seq = inputSeq++;
+  ws.send(JSON.stringify({ t: "input", x, y, seq }));
+  inputBuffer.push({ seq, x, y });
+  if (inputBuffer.length > MAX_INPUT_BUFFER) inputBuffer.shift();
+  if (selfPred) stepSelf(selfPred, { x, y }, STEP);
+}
+
+let lastNonZero = false;
+// Event-driven: fire immediately on any keyboard transition (no rAF wait).
+function onKeyChange() {
+  const { x, y } = readInput();
+  const nonZero = x !== 0 || y !== 0;
+  if (nonZero || lastNonZero) sendInput(x, y);
   lastNonZero = nonZero;
+}
+addEventListener("keydown", onKeyChange);
+addEventListener("keyup", onKeyChange);
+
+// While a direction is held (keyboard or stick), pump input at the sim rate so
+// prediction and server stay in lock-step — decoupled from the render rate.
+let inputAccumulator = 0;
+function pumpHeldInput(dt) {
+  const { x, y } = readInput();
+  const nonZero = x !== 0 || y !== 0;
+  if (!nonZero) { inputAccumulator = 0; lastNonZero = false; return; }
+  inputAccumulator += dt;
+  let guard = 0;
+  while (inputAccumulator >= STEP && guard < 8) {
+    inputAccumulator -= STEP;
+    sendInput(x, y);
+    guard++;
+  }
+  lastNonZero = true;
 }
 
 // ---- Render loop ----
-function draw() {
-  sampleAndSendInput();
+let lastFrameTs = performance.now();
+function draw(now) {
+  now = now || performance.now();
+  let dt = (now - lastFrameTs) / 1000;
+  lastFrameTs = now;
+  if (dt > 0.1) dt = 0.1; // clamp after tab was backgrounded
+  pumpHeldInput(dt);
 
   ctx.fillStyle = "#0e0f13";
   ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -322,11 +466,15 @@ function draw() {
     ctx.beginPath(); ctx.arc(wx(px), wy(py), pr * view.scale, 0, Math.PI * 2); ctx.fill();
   }
 
-  // Players (server truth).
+  // Players. Remotes render at server truth; the self dot renders at the
+  // locally PREDICTED position for zero-latency feel (spec §F4).
   for (const p of players) {
     const isSelf = p.id === selfId;
+    // Use prediction for self when available, else fall back to server truth.
+    const rx = isSelf && selfPred ? selfPred.x : p.x;
+    const ry = isSelf && selfPred ? selfPred.y : p.y;
     ctx.beginPath();
-    ctx.arc(wx(p.x), wy(p.y), PLAYER_R * view.scale, 0, Math.PI * 2);
+    ctx.arc(wx(rx), wy(ry), PLAYER_R * view.scale, 0, Math.PI * 2);
     ctx.fillStyle = p.color || "#E07A5F";
     ctx.globalAlpha = isSelf ? 1 : 0.85;
     ctx.fill();
@@ -338,7 +486,7 @@ function draw() {
     ctx.fillStyle = "#e8e8ea";
     ctx.font = `${Math.max(11, 13 * view.scale)}px system-ui`;
     ctx.textAlign = "center";
-    ctx.fillText(p.name || "player", wx(p.x), wy(p.y) - (PLAYER_R + 8) * view.scale);
+    ctx.fillText(p.name || "player", wx(rx), wy(ry) - (PLAYER_R + 8) * view.scale);
   }
 
   // HUD stats.
