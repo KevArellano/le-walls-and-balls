@@ -255,6 +255,81 @@ function applyCampaignDeltas(c) {
   }
 }
 
+// Reconstruct the full input seq from the low byte the server sends. The client
+// knows the highest seq it has sent (inputSeq-1); the true acked seq is the
+// largest value <= that whose low byte matches (drift can't exceed 255 frames).
+function fullSeqFromLow(low) {
+  const hi = inputSeq - 1;
+  if (hi < 0) return low;
+  let cand = (hi & ~0xFF) | low;
+  if (cand > hi) cand -= 256;
+  return cand;
+}
+
+// Decode a binary `state` frame (spec §2.7) into { players:[{i,x,y,vx,vy,q,r}],
+// campaign:{phase,level,in_zone,total,enemies:[{i,x,y,d}],items:[i]} }.
+function decodeStateFrame(ab) {
+  const dv = new DataView(ab);
+  let o = 0;
+  const type = dv.getUint8(o); o += 1;
+  if (type !== 0x01) return null;      // unknown frame type
+  const tick = dv.getUint32(o, true); o += 4;
+  const n = dv.getUint8(o); o += 1;
+  const ps = [];
+  for (let k = 0; k < n; k++) {
+    const i = dv.getUint8(o); o += 1;
+    const x = dv.getInt16(o, true); o += 2;
+    const y = dv.getInt16(o, true); o += 2;
+    const vx = dv.getInt16(o, true); o += 2;
+    const vy = dv.getInt16(o, true); o += 2;
+    const qlo = dv.getUint8(o); o += 1;
+    const flags = dv.getUint8(o); o += 1;
+    ps.push({ i, x, y, vx, vy, q: fullSeqFromLow(qlo), ready: (flags & 1) === 1 });
+  }
+  let campaign = null;
+  const hasCampaign = dv.getUint8(o); o += 1;
+  if (hasCampaign) {
+    const phaseCode = dv.getUint8(o); o += 1;
+    const level = dv.getUint8(o); o += 1;
+    const in_zone = dv.getUint8(o); o += 1;
+    const total = dv.getUint8(o); o += 1;
+    const em = dv.getUint8(o); o += 1;
+    const enemies = [];
+    for (let k = 0; k < em; k++) {
+      const i = dv.getUint8(o); o += 1;
+      const ex = dv.getInt16(o, true); o += 2;
+      const ey = dv.getInt16(o, true); o += 2;
+      const df = dv.getUint8(o); o += 1;
+      enemies.push({ i, x: ex, y: ey, d: (df & 1) === 1 });
+    }
+    const im = dv.getUint8(o); o += 1;
+    const items = [];
+    for (let k = 0; k < im; k++) { items.push(dv.getUint8(o)); o += 1; }
+    const phase = ["lobby", "playing", "victory"][phaseCode] || "lobby";
+    campaign = { phase, level, in_zone, total, enemies, items };
+  }
+  return { tick, players: ps, campaign };
+}
+
+// Apply a decoded state frame to the client model (shared by binary decode).
+function handleState(s) {
+  if (!s) return;
+  const seen = new Set();
+  for (const p of s.players) {
+    players.set(p.i, { x: p.x, y: p.y, vx: p.vx, vy: p.vy, q: p.q, ready: p.ready });
+    seen.add(p.i);
+  }
+  for (const i of [...players.keys()]) if (!seen.has(i)) players.delete(i);
+  campaign = s.campaign || null;
+  if (campaign && level) applyCampaignDeltas(campaign);
+  stateTimestamps.push(performance.now());
+  if (stateTimestamps.length > 90) stateTimestamps.shift();
+  if (selfIdx != null) {
+    const me = players.get(selfIdx);
+    if (me) reconcile(me);
+  }
+}
+
 function reconcile(serverSelf) {
   // serverSelf is the compact record { x, y, vx, vy, q } (integer units).
   // First authoritative fix: adopt server state outright.
@@ -311,6 +386,7 @@ function connect() {
 
   let sock;
   try { sock = new WebSocket(url); } catch (e) { setStatus("bad url", "bad"); return; }
+  sock.binaryType = "arraybuffer";   // receive the binary `state` frame as ArrayBuffer
   ws = sock;
 
   // Guard: only act if this socket is still the current one.
@@ -328,6 +404,9 @@ function connect() {
 
   sock.addEventListener("message", (ev) => {
     if (!isCurrent()) return;
+    // The hot-path `state` message arrives as a binary frame (spec §2.7);
+    // everything else is JSON text.
+    if (ev.data instanceof ArrayBuffer) { handleState(decodeStateFrame(ev.data)); return; }
     let msg; try { msg = JSON.parse(ev.data); } catch { return; }
     switch (msg.t) {
       case "welcome":
@@ -360,29 +439,6 @@ function connect() {
         };
         // A new level (index 0 = fresh run) clears our local ready intent.
         if (msg.index === 0) { iAmReady = false; updateReadyButton(); }
-        break;
-
-      case "state":
-        // Compact index-keyed players. Merge into the map (add/update).
-        {
-          const seen = new Set();
-          for (const p of msg.players) {
-            players.set(p.i, { x: p.x, y: p.y, vx: p.vx, vy: p.vy, q: p.q, ready: p.r });
-            seen.add(p.i);
-          }
-          // Drop players no longer present (defensive; player_leave also handles).
-          for (const i of [...players.keys()]) if (!seen.has(i)) players.delete(i);
-        }
-        campaign = msg.campaign || null;
-        // Apply campaign deltas onto the cached level geometry.
-        if (campaign && level) applyCampaignDeltas(campaign);
-        stateTimestamps.push(performance.now());
-        if (stateTimestamps.length > 90) stateTimestamps.shift();
-        // Reconcile the predicted self dot against server truth.
-        if (selfIdx != null) {
-          const me = players.get(selfIdx);
-          if (me) reconcile(me);
-        }
         break;
 
       case "pong": latencyMs = Date.now() - msg.ts; break;

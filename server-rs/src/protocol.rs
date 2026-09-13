@@ -42,16 +42,9 @@ pub enum ServerMsg {
     /// Assigns this client its player id and small per-room index.
     #[serde(rename = "welcome")]
     Welcome { id: String, idx: u8, tick: u32 },
-    /// Per-tick snapshot. `players` uses the compact index-keyed form; the
-    /// campaign block (when present) carries only per-tick dynamic deltas —
-    /// static geometry lives in `level`.
-    #[serde(rename = "state")]
-    State {
-        tick: u32,
-        players: Vec<PlayerState>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        campaign: Option<CampaignState>,
-    },
+    // NOTE: the per-tick `state` message is NOT a JSON variant. It is the only
+    // hot-path message and is sent as a WS **binary** frame — see
+    // `Room::state_frame` and spec §2.7. All variants here are JSON text.
     /// One-shot static level geometry. Sent on level start (broadcast) and to a
     /// newcomer who joins mid-level. Not repeated per tick.
     #[serde(rename = "level")]
@@ -86,43 +79,9 @@ pub enum ServerMsg {
     },
 }
 
-/// Compact per-tick player state. Fields are single-letter to cut JSON tag
-/// overhead at the snapshot rate; positions/velocities are whole world units
-/// (sub-pixel precision is invisible after rendering + client interpolation).
-#[derive(Serialize, Clone, Debug)]
-pub struct PlayerState {
-    /// Per-room player index (matches `welcome.idx` / `player_join.idx`).
-    pub i: u8,
-    pub x: i32,
-    pub y: i32,
-    pub vx: i32,
-    pub vy: i32,
-    /// Last processed input seq (reconciliation).
-    pub q: u32,
-    /// Campaign ready flag. Meaningful in Lobby; harmless otherwise.
-    pub r: bool,
-}
-
-/// Per-tick campaign deltas. Static geometry (walls, exit) is NOT here — it
-/// arrives once via `level`. Only the dynamic, changed parts ride each tick.
-#[derive(Serialize, Clone, Debug)]
-pub struct CampaignState {
-    /// "lobby" | "playing" | "victory".
-    pub phase: String,
-    /// 0-based level index while playing.
-    pub level: u8,
-    /// Enemies that changed since the last snapshot (moved or died), keyed by
-    /// index. Empty when nothing changed.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub enemies: Vec<EnemyDelta>,
-    /// Item indices collected since the last snapshot. Empty when none.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub items: Vec<u8>,
-    /// Count of players currently inside the exit zone.
-    pub in_zone: u8,
-    /// Total players in the room.
-    pub total: u8,
-}
+// Per-tick player + campaign state is NOT modeled here — it is encoded directly
+// as a binary frame in `Room::state_frame` (spec §2.7). The JSON structs below
+// are only used by the one-shot `level` message.
 
 #[derive(Serialize, Clone, Debug)]
 pub struct WallState {
@@ -139,16 +98,6 @@ pub struct EnemyFull {
     pub y: i32,
     pub r: i32,
     pub hp: i32,
-}
-
-/// Per-tick enemy delta: new position, and `d=true` when it just died.
-#[derive(Serialize, Clone, Debug)]
-pub struct EnemyDelta {
-    pub i: u8,
-    pub x: i32,
-    pub y: i32,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub d: bool,
 }
 
 /// Full item record sent once in `level`.

@@ -130,17 +130,20 @@ The simulation always steps at 60Hz. Broadcast cadence is decoupled — see §2.
 
 ---
 
-## 2. Wire Protocol (WebSocket, JSON, tagged by field `t`)
+## 2. Wire Protocol (WebSocket)
 
-The transport is a single WebSocket carrying JSON text frames. Every message has a
-discriminant field `t`. This contract is what binds the two services and MUST match
-exactly on both sides.
+The transport is a single WebSocket. **Control-plane** messages are JSON text
+frames tagged by a discriminant field `t`. The **hot-path** per-tick `state`
+message is a compact **binary** frame (§2.7) — the only binary message. WS frames
+are self-describing (text vs binary), so clients dispatch on frame kind first.
+This contract binds the two services and MUST match exactly on both sides.
 
-> **Protocol version: v2 (egress-optimized).** Compared to the original v1 the
-> per-tick state is compact and index-keyed, static level geometry is sent once,
-> enemy/item updates are deltas, and `state` broadcasts at a reduced cadence.
-> These changes cut room egress by roughly 25–30× for a full campaign room. v2
-> is **not** wire-compatible with v1 — both services must speak v2.
+> **Protocol version: v3 (binary hot path).** Building on v2 (index-keyed compact
+> state, one-shot geometry, deltas, reduced cadence), v3 encodes the per-tick
+> `state` as a binary frame instead of JSON — removing field-name/quote overhead
+> and giving a flat, predictable per-player cost (~10 bytes) that scales cleanly
+> with player count. All other messages remain JSON text. v3 is **not**
+> wire-compatible with earlier versions — both services must speak v3.
 
 ### 2.1 Client → Server
 
@@ -157,7 +160,7 @@ exactly on both sides.
 | `t`             | Fields                                              | Notes                                                        |
 |-----------------|-----------------------------------------------------|--------------------------------------------------------------|
 | `welcome`       | `id: string`, `idx: u8`, `tick: u32`                | Assigns this client its player id **and per-room index**.    |
-| `state`         | `tick: u32`, `players: PlayerState[]`, `campaign?`  | Per-tick snapshot; broadcast at the reduced cadence (§2.5).  |
+| **`state`**     | *(binary frame — see §2.7)*                         | Per-tick snapshot, **binary**; broadcast at the reduced cadence (§2.5). |
 | `level`         | `index, levels, walls[], enemies[], items[], exit`  | **One-shot** static level geometry (§2.4). Not repeated.     |
 | `campaign`      | `phase: string`, `level: u8`                        | Phase edge trigger (victory / lobby reset). Level starts use `level`. |
 | `player_join`   | `id`, `idx: u8`, `name`, `color`                    | Someone joined (also replayed to newcomer). Carries `idx`.   |
@@ -165,27 +168,16 @@ exactly on both sides.
 | `pong`          | `ts: u64`                                           | Echo of `ping.ts` for RTT.                                   |
 | `bump`          | `id`, `other`, `impulse: f64`                       | Collision event for audio/VFX only. `other` ∈ {peer id, `"pillar"`, `"wall"`, `"enemy"`}. |
 
-### 2.3 `PlayerState` (compact, index-keyed)
+### 2.3 Player identity vs per-tick state
 
-Identity (`name`/`color`) is sent **once** via `welcome`/`player_join` and joined
-client-side by index. Per-tick state is minimal — single-letter fields, whole
-world-unit integers (sub-pixel precision is invisible after interpolation):
-
-```json
-{ "i": 0, "x": 900, "y": 600, "vx": 120, "vy": -45, "q": 142, "r": false }
-```
-
-| Field | Meaning                                                        |
-|-------|----------------------------------------------------------------|
-| `i`   | Per-room player index (matches `welcome.idx` / `player_join.idx`). |
-| `x`,`y` | Position, integer world units.                               |
-| `vx`,`vy` | Velocity, integer world units/sec.                         |
-| `q`   | Last input `seq` the server processed (reconciliation).        |
-| `r`   | Campaign ready flag (meaningful in lobby).                     |
+Identity (`name`/`color`/`id`) is sent **once** via `welcome`/`player_join` and
+joined client-side by the per-room index `idx`. Per-tick position/velocity/ready
+arrive in the binary `state` frame (§2.7), keyed by that same index.
 
 The client keeps a map `idx → {id, name, color}` from join messages, and a map
-`idx → {x, y, vx, vy, q, ready}` from `state`. `q` drives prediction: discard
-acknowledged predicted inputs (`seq <= q`) and replay the rest.
+`idx → {x, y, vx, vy, q, ready}` decoded from each `state` frame. `q` (last input
+seq the server processed) drives prediction: discard acknowledged predicted inputs
+(`seq <= q`) and replay the rest.
 
 ### 2.4 `level` (one-shot static geometry) and campaign deltas
 
@@ -201,17 +193,12 @@ Static level geometry is expensive and never changes during a level, so it is se
   "exit":    { "x": 1604, "y": 1015, "r": 130 } }
 ```
 
-Per-tick, the `state.campaign` block carries only what changed — never geometry:
+Per-tick, the campaign section of the binary `state` frame (§2.7) carries only what
+changed — never geometry:
 
-```json
-{ "phase": "playing", "level": 0, "in_zone": 1, "total": 2,
-  "enemies": [ { "i": 0, "x": 812, "y": 418, "d": false } ],
-  "items":   [ 2 ] }
-```
-
-- `campaign.enemies` — enemies that moved ≥1 unit or changed alive-state, keyed by
-  `i`; `d:true` marks a just-killed enemy. Omitted when empty.
-- `campaign.items` — indices (`i`) of items collected this tick. Omitted when empty.
+- **enemy deltas** — enemies that moved ≥1 unit or changed alive-state, keyed by
+  index; a `dead` flag marks a just-killed enemy.
+- **item deltas** — indices of items collected this tick.
 - `in_zone` / `total` — players inside the exit zone / total, for progression UI.
 
 The client applies these onto the cached `level` maps. Walls/exit stay as first
@@ -233,6 +220,48 @@ Rust uses `#[serde(tag = "t")]` with `#[serde(rename = "...")]` per variant, so 
 JSON field is `t` and the value is the lowercase message name. Keep exactly these
 string values. Optional fields use `#[serde(skip_serializing_if = ...)]` — a missing
 field means "unchanged / empty", not `null`.
+
+### 2.7 Binary `state` frame layout
+
+The per-tick `state` is a **WS binary frame**, little-endian, with a leading type
+byte for versioning. It is the only binary message; all others are JSON text.
+
+```text
+offset  type  field
+0       u8    msg type   = 0x01 (state)
+1       u32   tick
+5       u8    N          player count
+        ── then N × 10-byte player records ──
+        u8    i          per-room index
+        i16   x, y       position (world units; arena ≤ 1800×1200 fits i16)
+        i16   vx, vy     velocity (units/sec; |v| ≤ MAX_SPEED=460 fits i16)
+        u8    qlo        low 8 bits of last processed input seq
+        u8    flags      bit0 = ready
+        ── campaign section ──
+        u8    hasCampaign  (0 | 1)
+        if hasCampaign:
+          u8  phase        0 = lobby, 1 = playing, 2 = victory
+          u8  level        0-based level index
+          u8  inZone       players inside the exit zone
+          u8  total        players in room
+          u8  M            enemy-delta count
+          M × ( u8 i, i16 x, i16 y, u8 flags[bit0 = dead] )
+          u8  K            item-delta count
+          K × ( u8 i )
+```
+
+Notes:
+- **`qlo` (seq low byte):** only the local player needs its acked seq for
+  reconciliation, and drift can't exceed 255 frames at these rates, so we send one
+  byte. The client reconstructs the full `u32` seq from its own send counter (the
+  largest value ≤ last-sent whose low byte matches).
+- **Integer quantization** to whole world units is invisible after rendering +
+  client interpolation (spec §0 arena is 1800×1200).
+- **Per-player cost is a flat ~10 bytes**, so a full 10-player campaign frame is
+  ~140 bytes (vs ~250 for the v2 compact JSON), and the cost scales linearly and
+  predictably with player count.
+- Encoded once per room per tick into a reused buffer and shared to every client
+  (the existing "encode once, `Arc` clone per client" pattern), now over bytes.
 
 ---
 
@@ -336,7 +365,7 @@ server-rs/
   src/
     main.rs       # networking, connection handling, game loop
     physics.rs    # constants, Vec2/Body, integrate + collision resolvers, pillars()
-    protocol.rs   # ClientMsg / ServerMsg / PlayerState (serde)
+    protocol.rs   # ClientMsg / ServerMsg (JSON); binary state in room.rs (§2.7)
     room.rs       # Room: players, per-tick physics, state snapshot
 ```
 
@@ -349,19 +378,19 @@ server-rs/
 ### `protocol.rs`
 - `ClientMsg` (`#[derive(Deserialize)] #[serde(tag="t")]`): `Join{room,name,color}`,
   `Input{x,y,seq}`, `Leave`, `Ping{ts}`.
-- `ServerMsg` (`#[derive(Serialize, Clone)] #[serde(tag="t")]`): `Welcome{id,idx,tick}`,
-  `State{tick,players,campaign?}`, `Level{index,levels,walls,enemies,items,exit}`,
+- `ServerMsg` (JSON, `#[derive(Serialize, Clone)] #[serde(tag="t")]`):
+  `Welcome{id,idx,tick}`, `Level{index,levels,walls,enemies,items,exit}`,
   `Campaign{phase,level}`, `PlayerJoin{id,idx,name,color}`, `PlayerLeave{id}`,
-  `Pong{ts}`, `Bump{id,other,impulse}` (see §2).
-- `PlayerState { i, x, y, vx, vy, q, r }` — compact/index-keyed (§2.3).
+  `Pong{ts}`, `Bump{id,other,impulse}` (see §2). Note: `state` is **not** a
+  `ServerMsg` variant — it is a binary frame built by `Room::state_frame` (§2.7).
 
 ### `room.rs`
 - `Room { id, players: HashMap<String,Player>, pillars: Vec<Body>, tick: u32, ... }`
   with pre-allocated `id_buf` and `state_buf` to avoid per-tick allocation.
 - `Player { id, name, color, body, input: PlayerInput{x,y,seq}, last_seq }`.
 - `add_player` (assigns spawn per §0), `remove_player`, `set_input` (normalizes input,
-  scaling down only when magnitude > 1), `tick() -> Vec<ServerMsg>` (bump events),
-  `state_snapshot() -> ServerMsg::State`, `is_full`, `is_empty`.
+  scaling down only when magnitude > 1), `tick() -> Vec<ServerMsg>` (bump/level
+  events), `state_frame() -> Vec<u8>` (binary snapshot, §2.7), `is_full`, `is_empty`.
 - `MAX_PLAYERS = 10`.
 
 ### `main.rs`
@@ -370,9 +399,10 @@ server-rs/
 - `main`: read port from env, bind `TcpListener` on `0.0.0.0:PORT`, spawn game loop,
   accept loop → spawn `handle_connection` per socket.
 - **`game_loop`** — fixed 60Hz. Each tick: lock rooms, run `room.tick()` collecting
-  bumps, take `state_snapshot()`, **collect outbound messages, release the lock, then
-  send** (never send while holding the write lock). Remove empty rooms. Sleep until
-  next tick; if behind, skip ahead rather than spiral.
+  bump/level events, and at the reduced state cadence take `state_frame()` (binary),
+  **collect outbound frames, release the lock, then send** (never send while holding
+  the write lock). Remove empty rooms. Sleep until next tick; if behind, skip ahead
+  rather than spiral.
 - **`handle_connection`** — perform WS handshake (a failed handshake = plain HTTP
   health probe → just drop it). Assign `player_id = Uuid::v4()`. Spawn a forward task
   draining an `mpsc` channel to the socket. Read loop dispatches `ClientMsg`:

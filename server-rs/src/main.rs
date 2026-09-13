@@ -33,15 +33,25 @@ const IDLE_KEEPALIVE_EVERY: u32 = 30; // ~2 snapshots/sec while idle
 /// for debugging.
 const STATE_EVERY: u32 = 3; // 60Hz / 3 = 20Hz
 
-/// Outbound frames are pre-serialized ONCE and shared as `Arc<str>` so a
-/// 10-client room does one JSON encode per tick, not ten.
-type Outbound = Arc<str>;
+/// Outbound frames are pre-encoded ONCE and shared (cheap `Arc` clone per
+/// client) so a 10-client room does one encode per tick, not ten. Control-plane
+/// messages are JSON text; the hot-path `state` frame is binary.
+#[derive(Clone)]
+enum Outbound {
+    Text(Arc<str>),
+    Binary(Arc<[u8]>),
+}
 
+/// Encode a control-plane message as shared JSON text.
 fn encode(msg: &ServerMsg) -> Outbound {
     // Serialization of our own types never fails; fall back defensively.
-    serde_json::to_string(msg)
-        .unwrap_or_else(|_| String::from("{}"))
-        .into()
+    let s = serde_json::to_string(msg).unwrap_or_else(|_| String::from("{}"));
+    Outbound::Text(s.into())
+}
+
+/// Wrap an already-built binary state frame as a shared outbound frame.
+fn encode_binary(bytes: Vec<u8>) -> Outbound {
+    Outbound::Binary(bytes.into())
 }
 
 /// A room plus the outbound channels for every connected client in it.
@@ -167,7 +177,7 @@ async fn game_loop(rooms: Rooms) {
                     frames.push(encode(b));
                 }
                 if send_state {
-                    frames.push(encode(&handle.room.state_snapshot()));
+                    frames.push(encode_binary(handle.room.state_frame()));
                 }
 
                 if !frames.is_empty() {
@@ -215,8 +225,12 @@ async fn handle_connection(stream: TcpStream, rooms: Rooms) {
     let (tx, mut rx) = unbounded_channel::<Outbound>();
     let forward = tokio::spawn(async move {
         while let Some(frame) = rx.recv().await {
-            // frame is already JSON; no per-client serialization here.
-            if ws_tx.send(Message::Text(frame.to_string())).await.is_err() {
+            // Frame is already encoded; map to the matching WS frame kind.
+            let ws_msg = match frame {
+                Outbound::Text(s) => Message::Text(s.to_string()),
+                Outbound::Binary(b) => Message::Binary(b.to_vec()),
+            };
+            if ws_tx.send(ws_msg).await.is_err() {
                 break;
             }
         }

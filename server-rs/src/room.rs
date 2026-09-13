@@ -4,9 +4,7 @@ use crate::level::{Level, CAMPAIGN_LEVELS};
 use crate::physics::{
     integrate, pillars, resolve_circle_circle, resolve_walls, Body, ACCEL, ARENA_H, ARENA_W, STEP,
 };
-use crate::protocol::{
-    CampaignState, EnemyDelta, EnemyFull, ItemFull, PlayerState, ServerMsg, WallState, ZoneState,
-};
+use crate::protocol::{EnemyFull, ItemFull, ServerMsg, WallState, ZoneState};
 use std::collections::HashMap;
 
 pub const MAX_PLAYERS: usize = 10;
@@ -71,8 +69,8 @@ pub struct Room {
     item_seen: Vec<bool>,
     /// Pre-allocated player-id ordering buffer to avoid per-tick allocation.
     id_buf: Vec<String>,
-    /// Pre-allocated snapshot buffer.
-    state_buf: Vec<PlayerState>,
+    /// Pre-allocated binary state frame buffer, reused each tick.
+    frame_buf: Vec<u8>,
     /// Pre-allocated player-body buffer reused for enemy AI + item checks so the
     /// level step never allocates in the hot loop.
     body_buf: Vec<Body>,
@@ -92,7 +90,7 @@ impl Room {
             enemy_seen: Vec::new(),
             item_seen: Vec::new(),
             id_buf: Vec::with_capacity(MAX_PLAYERS),
-            state_buf: Vec::with_capacity(MAX_PLAYERS),
+            frame_buf: Vec::with_capacity(256),
             body_buf: Vec::with_capacity(MAX_PLAYERS),
         }
     }
@@ -458,81 +456,102 @@ impl Room {
         self.level = Some(level);
     }
 
-    /// Build the full state snapshot (spec §2.2 `state`), including the campaign
-    /// block. The campaign block is always present so clients can render the
-    /// lobby ready-up and victory screens; it is `None` only if a room somehow
-    /// has no players (never broadcast in that case).
-    pub fn state_snapshot(&mut self) -> ServerMsg {
-        self.state_buf.clear();
-        for p in self.players.values() {
-            self.state_buf.push(PlayerState {
-                i: p.idx,
-                x: p.body.pos.x as i32,
-                y: p.body.pos.y as i32,
-                vx: p.body.vel.x as i32,
-                vy: p.body.vel.y as i32,
-                q: p.last_seq,
-                r: p.ready,
-            });
-        }
-        let campaign = self.campaign_snapshot();
-        ServerMsg::State {
-            tick: self.tick,
-            players: self.state_buf.clone(),
-            campaign,
-        }
-    }
+    /// Encode the per-tick `state` as a compact little-endian **binary** frame
+    /// (spec §2.7). This is the only hot-path message and the only one sent as a
+    /// WS Binary frame; all control-plane messages stay JSON text.
+    ///
+    /// Layout (little-endian):
+    /// ```text
+    /// u8  msg  = 0x01 (state)
+    /// u32 tick
+    /// u8  N    player count
+    /// N × player: u8 i, i16 x, i16 y, i16 vx, i16 vy, u8 qlo, u8 flags(bit0=ready)
+    /// u8  hasCampaign (0/1)
+    /// if hasCampaign:
+    ///   u8 phase(0 lobby/1 playing/2 victory), u8 level, u8 inZone, u8 total
+    ///   u8 M enemyDeltas; M × (u8 i, i16 x, i16 y, u8 flags(bit0=dead))
+    ///   u8 K itemDeltas;  K × (u8 i)
+    /// ```
+    /// `qlo` is the low byte of the last processed input seq — enough for the
+    /// local client to reconcile (drift can't exceed 256 frames at these rates).
+    pub fn state_frame(&mut self) -> Vec<u8> {
+        // Reused scratch buffer avoids a per-tick allocation.
+        self.frame_buf.clear();
+        let buf = &mut self.frame_buf;
 
-    /// Build the per-tick campaign delta block. Static geometry is omitted
-    /// (it rides `level`); only changed enemies/items + the scalar counters go
-    /// out. Updates the `*_seen` trackers so subsequent ticks diff correctly.
-    fn campaign_snapshot(&mut self) -> Option<CampaignState> {
-        let phase = match self.phase {
-            Phase::Lobby => "lobby",
-            Phase::Playing => "playing",
-            Phase::Victory => "victory",
+        buf.push(0x01); // msg type: state
+        buf.extend_from_slice(&self.tick.to_le_bytes());
+
+        buf.push(self.players.len() as u8);
+        for p in self.players.values() {
+            buf.push(p.idx);
+            buf.extend_from_slice(&(p.body.pos.x as i16).to_le_bytes());
+            buf.extend_from_slice(&(p.body.pos.y as i16).to_le_bytes());
+            buf.extend_from_slice(&(p.body.vel.x as i16).to_le_bytes());
+            buf.extend_from_slice(&(p.body.vel.y as i16).to_le_bytes());
+            buf.push((p.last_seq & 0xFF) as u8);
+            buf.push(if p.ready { 1 } else { 0 });
+        }
+
+        // Campaign block (always present so lobby/victory render; deltas only
+        // while a level is loaded).
+        buf.push(1); // hasCampaign
+        let phase_code: u8 = match self.phase {
+            Phase::Lobby => 0,
+            Phase::Playing => 1,
+            Phase::Victory => 2,
         };
         let total = self.players.len() as u8;
 
-        // Enemy + item deltas only exist while a level is loaded.
-        let (level_idx, enemy_deltas, item_deltas, in_zone) = match &self.level {
-            Some(l) => {
-                // Enemy deltas: moved ≥1 unit or alive-flag changed.
-                let mut enemy_deltas: Vec<EnemyDelta> = Vec::new();
-                for (i, e) in l.enemies.iter().enumerate() {
-                    let ex = e.body.pos.x as i32;
-                    let ey = e.body.pos.y as i32;
-                    let seen = self.enemy_seen.get(i).copied().unwrap_or_default();
-                    let moved = ex != seen.x || ey != seen.y;
-                    let died = e.alive != seen.alive;
-                    if moved || died {
-                        enemy_deltas.push(EnemyDelta {
-                            i: i as u8,
-                            x: ex,
-                            y: ey,
-                            d: !e.alive,
-                        });
+        // Compute enemy/item deltas + in_zone against the level (borrow scoped).
+        // EnemyWire = (index, x, y, dead).
+        type EnemyWire = (u8, i16, i16, bool);
+        let (level_idx, in_zone, enemy_deltas, item_deltas): (u8, u8, Vec<EnemyWire>, Vec<u8>) =
+            match &self.level {
+                Some(l) => {
+                    let mut enemy_deltas = Vec::new();
+                    for (i, e) in l.enemies.iter().enumerate() {
+                        let ex = e.body.pos.x as i32;
+                        let ey = e.body.pos.y as i32;
+                        let seen = self.enemy_seen.get(i).copied().unwrap_or_default();
+                        if ex != seen.x || ey != seen.y || e.alive != seen.alive {
+                            enemy_deltas.push((i as u8, ex as i16, ey as i16, !e.alive));
+                        }
                     }
-                }
-                // Item deltas: indices that flipped to collected.
-                let mut item_deltas: Vec<u8> = Vec::new();
-                for (i, it) in l.items.iter().enumerate() {
-                    let seen = self.item_seen.get(i).copied().unwrap_or(false);
-                    if it.collected && !seen {
-                        item_deltas.push(i as u8);
+                    let mut item_deltas = Vec::new();
+                    for (i, it) in l.items.iter().enumerate() {
+                        let seen = self.item_seen.get(i).copied().unwrap_or(false);
+                        if it.collected && !seen {
+                            item_deltas.push(i as u8);
+                        }
                     }
+                    let in_zone = self
+                        .players
+                        .values()
+                        .filter(|p| l.in_exit(p.body.pos.x, p.body.pos.y))
+                        .count() as u8;
+                    (l.index, in_zone, enemy_deltas, item_deltas)
                 }
-                let in_zone = self
-                    .players
-                    .values()
-                    .filter(|p| l.in_exit(p.body.pos.x, p.body.pos.y))
-                    .count() as u8;
-                (l.index, enemy_deltas, item_deltas, in_zone)
-            }
-            None => (0, Vec::new(), Vec::new(), 0),
-        };
+                None => (0, 0, Vec::new(), Vec::new()),
+            };
 
-        // Commit the trackers to what we just observed (borrow of level ended).
+        buf.push(phase_code);
+        buf.push(level_idx);
+        buf.push(in_zone);
+        buf.push(total);
+        buf.push(enemy_deltas.len() as u8);
+        for (i, x, y, dead) in &enemy_deltas {
+            buf.push(*i);
+            buf.extend_from_slice(&x.to_le_bytes());
+            buf.extend_from_slice(&y.to_le_bytes());
+            buf.push(if *dead { 1 } else { 0 });
+        }
+        buf.push(item_deltas.len() as u8);
+        for i in &item_deltas {
+            buf.push(*i);
+        }
+
+        // Commit delta trackers to what we just observed (level borrow ended).
         if let Some(l) = &self.level {
             self.enemy_seen.clear();
             for e in l.enemies.iter() {
@@ -548,14 +567,7 @@ impl Room {
             }
         }
 
-        Some(CampaignState {
-            phase: phase.to_string(),
-            level: level_idx,
-            enemies: enemy_deltas,
-            items: item_deltas,
-            in_zone,
-            total,
-        })
+        self.frame_buf.clone()
     }
 }
 
