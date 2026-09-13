@@ -1,5 +1,6 @@
 //! Speck authoritative WebSocket game server (spec §B).
 
+mod level;
 mod physics;
 mod protocol;
 mod room;
@@ -296,6 +297,20 @@ async fn handle_connection(stream: TcpStream, rooms: Rooms) {
             ClientMsg::Leave => {
                 if let Some(old) = current_room.take() {
                     leave_room(&rooms, &old, &player_id).await;
+                }
+            }
+            ClientMsg::Ready { ready } => {
+                if let Some(room_id) = &current_room {
+                    let mut guard = rooms.write().await;
+                    if let Some(handle) = guard.get_mut(room_id) {
+                        // Toggling ready is a meaningful event: wake the room so
+                        // the ready state broadcasts promptly.
+                        handle.idle_ticks = 0;
+                        // Auto-start the moment every player is ready.
+                        if handle.room.set_ready(&player_id, ready) {
+                            handle.room.start_campaign();
+                        }
+                    }
                 }
             }
             ClientMsg::Ping { ts } => {

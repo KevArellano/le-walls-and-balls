@@ -37,6 +37,8 @@
     padding: 5px 10px; font-size: 12px; font-weight: 600; cursor: pointer;
   }
   button:hover { filter: brightness(1.1); }
+  #ready.on { background: #81B29A; }
+  #campaign { font-size: 12px; color: #F2CC8F; }
   #hint { margin-top: 8px; color: #8b8f9a; font-size: 11px; }
   canvas { display: block; width: 100vw; height: 100vh; touch-action: none; }
 
@@ -89,7 +91,11 @@
     <span id="status" class="bad">disconnected</span>
   </div>
   <div>players: <b id="count">0</b> &nbsp; latency: <b id="lat">–</b> ms &nbsp; state: <b id="hz">0</b> Hz</div>
-  <div id="hint">WASD / arrow keys to move. Open two tabs in the same room to test collisions.</div>
+  <div class="row">
+    <button id="ready">Ready ✗</button>
+    <span id="campaign">lobby</span>
+  </div>
+  <div id="hint">WASD / arrow keys to move. Open two tabs in the same room to test collisions. Everyone press <b>Ready</b> to auto-start the campaign.</div>
 </div>
 <canvas id="c"></canvas>
 <div id="stick"><div id="knob"></div></div>
@@ -198,6 +204,8 @@ const wy = (y) => view.oy + y * view.scale;
 // ---- Networking (raw WebSocket, no framework) ----
 let ws = null, selfId = null, joined = false, explicitClose = false;
 let players = [];        // latest snapshot (remote truth for other players)
+let campaign = null;     // latest campaign block from state (null in free-play)
+let iAmReady = false;    // local intent, echoed by server via players[].ready
 let inputSeq = 0;
 let stateTimestamps = [];
 let latencyMs = null;
@@ -285,9 +293,11 @@ function connect() {
       case "welcome":
         selfId = msg.id; joined = true; setStatus("joined", "ok");
         selfPred = null; inputBuffer.length = 0; inputSeq = 0;
+        iAmReady = false; updateReadyButton();
         break;
       case "state":
         players = msg.players;
+        campaign = msg.campaign || null;
         stateTimestamps.push(performance.now());
         if (stateTimestamps.length > 90) stateTimestamps.shift();
         // Reconcile the predicted self dot against server truth.
@@ -298,6 +308,12 @@ function connect() {
         break;
       case "pong": latencyMs = Date.now() - msg.ts; break;
       case "player_leave": if (msg.id === "full") setStatus("room full", "bad"); break;
+      case "campaign":
+        // Edge trigger for level/victory transitions. The authoritative detail
+        // rides on state.campaign; this is just a cue. On a new run/level the
+        // server clears our ready flag, so reset local intent.
+        if (msg.phase === "victory" || msg.level === 0) { iAmReady = false; updateReadyButton(); }
+        break;
       case "player_join": case "bump": break;
     }
   });
@@ -321,6 +337,19 @@ function connect() {
   });
 }
 $("connect").addEventListener("click", connect);
+
+// ---- Campaign ready toggle ----
+function updateReadyButton() {
+  const btn = $("ready");
+  btn.textContent = iAmReady ? "Ready ✓" : "Ready ✗";
+  btn.classList.toggle("on", iAmReady);
+}
+$("ready").addEventListener("click", () => {
+  if (!(ws && ws.readyState === 1 && joined)) return;
+  iAmReady = !iAmReady;
+  ws.send(JSON.stringify({ t: "ready", ready: iAmReady }));
+  updateReadyButton();
+});
 
 // ---- Input: WASD / arrows -> normalized {x,y} ----
 const keys = new Set();
@@ -460,10 +489,59 @@ function draw(now) {
     ctx.beginPath(); ctx.moveTo(wx(0), wy(gy)); ctx.lineTo(wx(ARENA_W), wy(gy)); ctx.stroke();
   }
 
-  // Pillars.
-  ctx.fillStyle = "#3a3f4b";
-  for (const [px, py, pr] of PILLARS) {
-    ctx.beginPath(); ctx.arc(wx(px), wy(py), pr * view.scale, 0, Math.PI * 2); ctx.fill();
+  const playing = campaign && campaign.phase === "playing";
+
+  // Base pillars: only in free-play / lobby. During a campaign the level's own
+  // walls replace them, so we don't draw both.
+  if (!playing) {
+    ctx.fillStyle = "#3a3f4b";
+    for (const [px, py, pr] of PILLARS) {
+      ctx.beginPath(); ctx.arc(wx(px), wy(py), pr * view.scale, 0, Math.PI * 2); ctx.fill();
+    }
+  }
+
+  // Campaign layer: exit zone (under everything), walls, items, enemies.
+  if (playing) {
+    const c = campaign;
+    // Exit zone — filled ring the group gathers in. Turns green once cleared.
+    const cleared = c.enemies.every((e) => !e.alive);
+    ctx.beginPath();
+    ctx.arc(wx(c.exit.x), wy(c.exit.y), c.exit.r * view.scale, 0, Math.PI * 2);
+    ctx.fillStyle = cleared ? "rgba(129,178,154,0.16)" : "rgba(242,204,143,0.10)";
+    ctx.fill();
+    ctx.lineWidth = 2 * view.scale;
+    ctx.strokeStyle = cleared ? "rgba(129,178,154,0.8)" : "rgba(242,204,143,0.6)";
+    ctx.setLineDash([10 * view.scale, 8 * view.scale]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Walls (static obstacles).
+    ctx.fillStyle = "#3a3f4b";
+    for (const w of c.walls) {
+      ctx.beginPath(); ctx.arc(wx(w.x), wy(w.y), w.r * view.scale, 0, Math.PI * 2); ctx.fill();
+    }
+
+    // Items (uncollected only).
+    for (const it of c.items) {
+      if (it.collected) continue;
+      const r = 16 * view.scale;
+      ctx.beginPath(); ctx.arc(wx(it.x), wy(it.y), r, 0, Math.PI * 2);
+      ctx.fillStyle = "#F2CC8F"; ctx.fill();
+      ctx.lineWidth = 2 * view.scale; ctx.strokeStyle = "#ffffff"; ctx.stroke();
+    }
+
+    // Enemies (living only). Red dots with an HP pip count.
+    for (const e of c.enemies) {
+      if (!e.alive) continue;
+      ctx.beginPath(); ctx.arc(wx(e.x), wy(e.y), e.r * view.scale, 0, Math.PI * 2);
+      ctx.fillStyle = "#E07A5F"; ctx.fill();
+      ctx.lineWidth = 2 * view.scale; ctx.strokeStyle = "#3a1a12"; ctx.stroke();
+      ctx.fillStyle = "#2a0f0a";
+      ctx.font = `${Math.max(10, 12 * view.scale)}px system-ui`;
+      ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      ctx.fillText(String(e.hp), wx(e.x), wy(e.y));
+      ctx.textBaseline = "alphabetic";
+    }
   }
 
   // Players. Remotes render at server truth; the self dot renders at the
@@ -492,6 +570,24 @@ function draw(now) {
   // HUD stats.
   $("count").textContent = players.length;
   $("lat").textContent = latencyMs == null ? "–" : latencyMs;
+
+  // Campaign status line.
+  if (campaign) {
+    const c = campaign;
+    if (c.phase === "lobby") {
+      const readyCount = players.filter((p) => p.ready).length;
+      $("campaign").textContent = `lobby — ready ${readyCount}/${c.total}`;
+    } else if (c.phase === "playing") {
+      const alive = c.enemies.filter((e) => e.alive).length;
+      const items = c.items.filter((it) => !it.collected).length;
+      $("campaign").textContent =
+        `level ${c.level + 1}/${c.levels} — enemies ${alive} · items ${items} · in-zone ${c.in_zone}/${c.total}`;
+    } else if (c.phase === "victory") {
+      $("campaign").textContent = "🏆 victory! ready up to run again";
+    }
+  } else {
+    $("campaign").textContent = "free-play";
+  }
   if (stateTimestamps.length > 2) {
     const span = (stateTimestamps[stateTimestamps.length - 1] - stateTimestamps[0]) / 1000;
     $("hz").textContent = span > 0 ? (stateTimestamps.length / span).toFixed(0) : "0";
