@@ -88,6 +88,7 @@
   </div>
   <div class="row">
     <button id="connect">Connect</button>
+    <button id="disconnect">Disconnect</button>
     <span id="status" class="bad">disconnected</span>
   </div>
   <div>players: <b id="count">0</b> &nbsp; latency: <b id="lat">–</b> ms &nbsp; state: <b id="hz">0</b> Hz</div>
@@ -338,6 +339,36 @@ function connect() {
 }
 $("connect").addEventListener("click", connect);
 
+// Explicitly leave the room and close the socket. `explicitClose` stops the
+// close handler from auto-reconnecting. We send `leave` first so the server
+// removes us immediately rather than waiting to notice a dead socket.
+function disconnect() {
+  explicitClose = true;
+  clearInterval(pingTimer);
+  if (ws && ws.readyState === 1) {
+    try { ws.send(JSON.stringify({ t: "leave" })); } catch {}
+  }
+  teardown(ws);
+  ws = null;
+  joined = false; selfId = null; players = []; campaign = null;
+  iAmReady = false; updateReadyButton();
+  setStatus("disconnected", "bad");
+}
+$("disconnect").addEventListener("click", disconnect);
+
+// The browser doesn't reliably flush a graceful WebSocket close on tab
+// close/navigation, which can leave a stale player in the room from a previous
+// session. Proactively send `leave` while the socket is still open. `pagehide`
+// is the most reliable across mobile/desktop; `beforeunload` covers the rest.
+function leaveOnUnload() {
+  if (ws && ws.readyState === 1) {
+    try { ws.send(JSON.stringify({ t: "leave" })); } catch {}
+    try { ws.close(); } catch {}
+  }
+}
+addEventListener("pagehide", leaveOnUnload);
+addEventListener("beforeunload", leaveOnUnload);
+
 // ---- Campaign ready toggle ----
 function updateReadyButton() {
   const btn = $("ready");
@@ -474,10 +505,23 @@ function draw(now) {
   ctx.fillStyle = "#0e0f13";
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-  // Rink border (playable inset ignored here; draw full arena bounds).
+  // Arena bounds (full extent) — faint.
   ctx.strokeStyle = "#2a2d36";
   ctx.lineWidth = 2 * view.scale;
   ctx.strokeRect(wx(0), wy(0), ARENA_W * view.scale, ARENA_H * view.scale);
+
+  // Playable border: the inset the physics engine actually clamps the player
+  // CENTER to (WALL_PAD + PLAYER_R on each side). Drawing this makes the
+  // "invisible wall" the player stops at visible and true to the sim.
+  {
+    const pad = WALL_PAD + PLAYER_R;
+    ctx.strokeStyle = "rgba(126,178,221,0.35)";
+    ctx.lineWidth = 1.5 * view.scale;
+    ctx.strokeRect(
+      wx(pad), wy(pad),
+      (ARENA_W - pad * 2) * view.scale, (ARENA_H - pad * 2) * view.scale
+    );
+  }
 
   // Grid.
   ctx.strokeStyle = "rgba(255,255,255,0.03)";
@@ -491,13 +535,30 @@ function draw(now) {
 
   const playing = campaign && campaign.phase === "playing";
 
+  // Draw a static obstacle: the solid body at radius r, plus a faint ring at
+  // r + PLAYER_R showing the true no-go boundary the player CENTER can't cross
+  // (matches resolve_circle_circle against a static body). Without the ring the
+  // player appears to stop short of the drawn edge.
+  function drawObstacle(px, py, pr) {
+    // Collision boundary (player center limit).
+    ctx.beginPath();
+    ctx.arc(wx(px), wy(py), (pr + PLAYER_R) * view.scale, 0, Math.PI * 2);
+    ctx.fillStyle = "rgba(58,63,75,0.28)";
+    ctx.fill();
+    ctx.lineWidth = 1 * view.scale;
+    ctx.strokeStyle = "rgba(126,178,221,0.25)";
+    ctx.stroke();
+    // Solid body.
+    ctx.beginPath();
+    ctx.arc(wx(px), wy(py), pr * view.scale, 0, Math.PI * 2);
+    ctx.fillStyle = "#3a3f4b";
+    ctx.fill();
+  }
+
   // Base pillars: only in free-play / lobby. During a campaign the level's own
   // walls replace them, so we don't draw both.
   if (!playing) {
-    ctx.fillStyle = "#3a3f4b";
-    for (const [px, py, pr] of PILLARS) {
-      ctx.beginPath(); ctx.arc(wx(px), wy(py), pr * view.scale, 0, Math.PI * 2); ctx.fill();
-    }
+    for (const [px, py, pr] of PILLARS) drawObstacle(px, py, pr);
   }
 
   // Campaign layer: exit zone (under everything), walls, items, enemies.
@@ -515,11 +576,8 @@ function draw(now) {
     ctx.stroke();
     ctx.setLineDash([]);
 
-    // Walls (static obstacles).
-    ctx.fillStyle = "#3a3f4b";
-    for (const w of c.walls) {
-      ctx.beginPath(); ctx.arc(wx(w.x), wy(w.y), w.r * view.scale, 0, Math.PI * 2); ctx.fill();
-    }
+    // Walls (static obstacles) — body + true collision boundary.
+    for (const w of c.walls) drawObstacle(w.x, w.y, w.r);
 
     // Items (uncollected only).
     for (const it of c.items) {
