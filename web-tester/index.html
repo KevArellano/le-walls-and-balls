@@ -73,6 +73,43 @@
     box-shadow: 0 2px 12px rgba(0,0,0,0.4);
     pointer-events: none;
   }
+
+  /* Credits overlay — hidden until victory (toggled via JS `.on`). */
+  #credits {
+    position: fixed; inset: 0; z-index: 40;
+    display: none; overflow: hidden;
+    background: rgba(8,9,12,0.92);
+    backdrop-filter: blur(3px);
+    text-align: center;
+    cursor: pointer;
+  }
+  #credits.on { display: block; }
+  #creditsScroll {
+    position: absolute; left: 0; right: 0;
+    /* Start fully below the viewport; animate up past the top. */
+    top: 100%;
+    padding: 0 24px;
+    animation: creditsRoll var(--credits-dur, 14s) linear forwards;
+  }
+  #creditsScroll h1 {
+    font-size: clamp(40px, 9vw, 88px); letter-spacing: 8px; margin: 0 0 6px;
+    color: #7EB2DD; font-weight: 800;
+  }
+  #creditsScroll .tagline { color: #8b8f9a; margin: 0 0 8px; font-size: 15px; }
+  #creditsScroll .role { color: #81B29A; margin: 18px 0 2px; font-size: 15px; letter-spacing: 1px; }
+  #creditsScroll .name { color: #e8e8ea; margin: 0; font-size: 18px; font-weight: 600; }
+  #creditsScroll .fin  { color: #F2CC8F; margin-top: 22px; font-size: 16px; }
+  #creditsScroll .gap  { height: 40px; }
+  #creditsSkip {
+    position: fixed; bottom: calc(16px + env(safe-area-inset-bottom));
+    left: 0; right: 0; text-align: center;
+    color: #6b6f7a; font-size: 12px; letter-spacing: 1px;
+  }
+  @keyframes creditsRoll {
+    /* Travel a full viewport + the block's own height so it clears the top. */
+    from { transform: translateY(0); }
+    to   { transform: translateY(calc(-100vh - 100%)); }
+  }
 </style>
 </head>
 <body>
@@ -101,6 +138,26 @@
 </div>
 <canvas id="c"></canvas>
 <div id="stick"><div id="knob"></div></div>
+
+<!-- Credits overlay: shown briefly on campaign victory, text scrolls up, then
+     auto-returns to the lobby. Click anywhere to skip. -->
+<div id="credits">
+  <div id="creditsScroll">
+    <h1>SPECK</h1>
+    <p class="tagline">A sliding-dots co-op campaign</p>
+    <div class="gap"></div>
+    <p class="role">— Thanks for playing —</p>
+    <div class="gap"></div>
+    <p class="role">Authoritative Simulation</p><p class="name">Rust · Tokio · 60Hz</p>
+    <p class="role">Client Prediction</p><p class="name">Canvas 2D · WebSocket</p>
+    <p class="role">Procedural Levels</p><p class="name">Walls · Enemies · Items</p>
+    <div class="gap"></div>
+    <p class="role">You cleared all three levels.</p>
+    <div class="gap"></div>
+    <p class="fin">Returning to the lobby…</p>
+  </div>
+  <div id="creditsSkip">click to skip</div>
+</div>
 <script type="module">
 // ---- Shared constants (spec §0) — MUST match physics.rs exactly ----
 const ARENA_W = 1800, ARENA_H = 1200;
@@ -447,7 +504,8 @@ function connect() {
         // Edge trigger for victory / lobby reset. Level starts come via `level`.
         if (msg.phase === "victory") {
           iAmReady = false; updateReadyButton();
-          level = null; // clear the arena on the victory screen
+          level = null;     // clear the arena behind the credits
+          showCredits();    // roll credits, then auto-return to lobby
         }
         break;
 
@@ -458,6 +516,7 @@ function connect() {
   sock.addEventListener("close", (ev) => {
     if (!isCurrent()) return;   // a retired socket closing — ignore
     joined = false; players = new Map();
+    endCredits();   // don't leave the credits overlay stuck after a drop
     clearInterval(pingTimer);
     console.warn("[speck] socket closed", { code: ev.code, reason: ev.reason, wasClean: ev.wasClean, url });
     if (!explicitClose) {
@@ -489,6 +548,7 @@ function disconnect() {
   joined = false; selfId = null; selfIdx = null;
   players = new Map(); peers.clear(); campaign = null; level = null;
   iAmReady = false; updateReadyButton();
+  endCredits();   // dismiss the credits overlay if it was up
   setStatus("disconnected", "bad");
 }
 $("disconnect").addEventListener("click", disconnect);
@@ -520,11 +580,12 @@ $("ready").addEventListener("click", () => {
 });
 
 // ---- Music: one loop per phase, driven purely by campaign.phase/level ----
-// Files live in ./audio/ and ship with the site. We have 4 tracks: the lobby
-// theme and one per level. Victory reuses the lobby track (it returns you to
-// ready-up). Missing files fail silent — never throw.
+// Files live in ./audio/ and ship with the site: lobby theme, one per level,
+// and a credits theme played over the victory credits roll. Missing files fail
+// silent — never throw.
 const MUSIC = {
   lobby: "audio/lobby.mp3",
+  credits: "audio/credits.mp3",
   level1: "audio/level1.mp3",
   level2: "audio/level2.mp3",
   level3: "audio/level3.mp3",
@@ -532,14 +593,15 @@ const MUSIC = {
 const MUSIC_VOLUME = 0.5;   // target volume for the active track
 const FADE_PER_SEC = 1.6;   // cross-fade speed (volume units/sec)
 
-// Pre-create looping Audio elements, one per unique file.
+// Pre-create Audio elements, one per unique file. All loop except `credits`,
+// which plays once over the (finite) credits roll.
 const musicEls = {};
 for (const [key, src] of Object.entries(MUSIC)) {
   const a = new Audio(src);
-  a.loop = true;
+  a.loop = key !== "credits";
   a.preload = "auto";
   a.volume = 0;
-  // Swallow load/decment errors so a missing file is silent, not fatal.
+  // Swallow load/decode errors so a missing file is silent, not fatal.
   a.addEventListener("error", () => {});
   musicEls[key] = a;
 }
@@ -551,6 +613,8 @@ let currentTrack = null;     // key of the track we want playing
 // Map campaign state -> track key. Null means "no music" (e.g. free-play).
 function trackForCampaign() {
   if (!campaign) return null;
+  // While the victory credits roll is on screen, play the credits theme.
+  if (creditsActive) return "credits";
   if (campaign.phase === "lobby" || campaign.phase === "victory") return "lobby";
   if (campaign.phase === "playing") {
     const key = "level" + (campaign.level + 1); // level index 0 -> level1
@@ -600,6 +664,41 @@ $("mute").addEventListener("click", () => {
     musicEls[currentTrack].play().catch(() => {});
   }
 });
+
+// ---- Victory credits roll (client-only presentation) ----
+// On campaign victory, show a brief scrolling-credits overlay with its own
+// theme, then auto-return to the lobby view. Click skips.
+const CREDITS_DURATION_S = 14;   // must match the CSS --credits-dur
+let creditsActive = false;
+let creditsTimer = null;
+
+function showCredits() {
+  if (creditsActive) return;
+  creditsActive = true;
+  const el = $("credits");
+  // Restart the scroll animation from the bottom by reflowing the node.
+  const scroll = $("creditsScroll");
+  scroll.style.setProperty("--credits-dur", CREDITS_DURATION_S + "s");
+  scroll.style.animation = "none";
+  void scroll.offsetHeight;            // force reflow so the animation replays
+  scroll.style.animation = "";
+  el.classList.add("on");
+  clearTimeout(creditsTimer);
+  creditsTimer = setTimeout(endCredits, CREDITS_DURATION_S * 1000);
+}
+
+function endCredits() {
+  if (!creditsActive) return;
+  creditsActive = false;
+  clearTimeout(creditsTimer);
+  $("credits").classList.remove("on");
+  // Returning to the lobby view: the server has already reset us to lobby +
+  // cleared ready. Reflect that locally so the ready-up UI is fresh.
+  iAmReady = false; updateReadyButton();
+}
+
+// Click/tap anywhere on the overlay skips straight back to the lobby.
+$("credits").addEventListener("click", endCredits);
 
 // ---- Input: WASD / arrows -> normalized {x,y} ----
 const keys = new Set();

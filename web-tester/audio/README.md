@@ -5,10 +5,11 @@ files here with these exact names (served relative to `index.html`):
 
 | File          | When it plays                                  |
 |---------------|------------------------------------------------|
-| `lobby.mp3`   | Lobby (ready-up) **and** the victory screen    |
+| `lobby.mp3`   | Lobby (ready-up) and after the credits return  |
 | `level1.mp3`  | Campaign level 1                               |
 | `level2.mp3`  | Campaign level 2                               |
 | `level3.mp3`  | Campaign level 3                               |
+| `credits.mp3` | Victory credits roll (plays once, not looped)  |
 
 Notes:
 - Music is entirely client-side, driven off `campaign.phase` / `campaign.level`
